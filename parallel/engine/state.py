@@ -6,7 +6,7 @@ from typing import Callable, Any, Tuple
 from parallel.engine.utils.imports import is_deepspeed_available, is_fp8_available
 import torch
 
-from .utils.dataclasses import DistType
+from .utils.dataclasses import DistType, GradientAccumulationPlugin
 from .utils.environment import DEFAULT_MASTER_PORT, get_allow_cp_standalone, get_cpu_distributed_information, get_debug_mode, get_fork_launched, get_fsdp_offload_params, get_fsdp_state_dict_type, get_int_from_env, get_local_rank, get_master_addr, get_master_port, get_mixed_precision, get_omp_num_threads, get_torch_device, get_use_cpu, get_use_deepspeed, get_use_fsdp
 
 def empty_fn(*args, **kwargs):
@@ -66,6 +66,7 @@ class RuntimeState:
                             torch.sdaa.set_device(f"sdaa:{local_rank}")
                         if (
                             self.backend == "nccl"
+                            and get_use_fsdp()
                             and (
                                 get_fsdp_offload_params()
                                 or get_fsdp_state_dict_type() == "FULL_STATE_DICT"
@@ -301,6 +302,11 @@ class EngineState:
             else:
                 self._mixed_precision = mixed_precision
             if get_use_deepspeed() and not cpu:
+                if deepspeed_plugin is None:
+                    raise ValueError(
+                        "DeepSpeed is enabled but no `deepspeed_plugin` was provided. "
+                        "Pass a DeepSpeedPlugin when constructing Engine()."
+                    )
                 self.distributed_type = DistType.DEEPSPEED
                 if not isinstance(deepspeed_plugin, dict):
                     deepspeed_plugin.set_mixed_precision(mixed_precision)
@@ -416,11 +422,16 @@ class EngineState:
     def get_deepspeed_plugin(self, name: str):
         if self.distributed_type != DistType.DEEPSPEED:
             return None
+        if not isinstance(self.deepspeed_plugins, dict):
+            return self.deepspeed_plugins
         return self.deepspeed_plugins[name]
 
     def select_deepspeed_plugin(self, name: str):
         if self.distributed_type != DistType.DEEPSPEED:
             return None
+        if not isinstance(self.deepspeed_plugins, dict):
+            self.deepspeed_plugins.select(_from_accelerator_state=True)
+            return
         for key, plugin in self.deepspeed_plugins.items():
             if key != name:
                 plugin._unselect()

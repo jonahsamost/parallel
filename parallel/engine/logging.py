@@ -4,16 +4,23 @@ import logging
 import os
 from enum import Enum
 
+from parallel.engine.state import RuntimeState
+
 from .utils.environment import get_log_level
 
 
 class MultiProcLogger(logging.LoggerAdapter):
     @staticmethod
     def _should_log(main_process_only):
-        ...
+        state = RuntimeState()
+        return not main_process_only or (main_process_only and state.is_main_process)
     
     def process(self, msg, kwargs):
-        ...
+        msg, kwargs = super().process(msg, kwargs)
+        kwargs.setdefault("stacklevel", 2)
+        state = RuntimeState()
+        msg = f"[RANK {state.process_idx}] {msg}"
+        return msg, kwargs
     
     def log(self, level, msg, *args, **kwargs):
         ...
