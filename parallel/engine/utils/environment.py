@@ -83,3 +83,12 @@ def get_fork_launched():
 
 def get_use_cpu():
     return str_to_bool(os.environ.get("ENGINE_USE_CPU", None))
+
+def get_mixed_precision():
+    return os.environ.get("ENGINE_MIXED_PRECISION", "no")
+
+def get_allow_cp_standalone():
+    return str_to_bool(os.environ.get("ENGINE_ALLOW_CP_STANDALONE", ""))
+
+def get_use_megatron():
+    return str_to_bool(os.environ.get("ENGINE_USE_MEGATRON", ""))

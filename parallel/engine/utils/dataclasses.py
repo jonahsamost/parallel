@@ -8,3 +8,4 @@ class DistType(str, Enum):
     MULTI_GPU = "MULTI_GPU"
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
+    FLAM = "FLAM"

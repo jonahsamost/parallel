@@ -16,3 +16,9 @@ def is_wandb_available():
 
 def is_deepspeed_available():
     return _is_package_available("deepspeed")
+
+def is_torchao_available():
+    return _is_package_available("torchao")
+
+def is_fp8_available():
+    return is_torchao_available()
