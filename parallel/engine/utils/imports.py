@@ -22,3 +22,9 @@ def is_torchao_available():
 
 def is_fp8_available():
     return is_torchao_available()
+
+def is_datasets_available():
+    return _is_package_available("datasets")
+
+def is_torchdata_available():
+    return _is_package_available("torchdata")

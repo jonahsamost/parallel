@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
-from enum import Enum
 
 from parallel.engine.state import RuntimeState
 
@@ -23,8 +21,20 @@ class MultiProcLogger(logging.LoggerAdapter):
         return msg, kwargs
     
     def log(self, level, msg, *args, **kwargs):
-        ...
-
+        if RuntimeState._shared_state == {}:
+            raise RuntimeError("Cannot use logger before you init the RuntimeState")
+        main_process_only = kwargs.pop("main_process_only", True)
+        in_order = kwargs.pop("in_order", False)
+        if self.isEnabledFor(level):
+            msg, kwargs = self.process(msg, kwargs)
+            if not in_order and self._should_log(main_process_only):
+                self.logger.lg(level, msg, *args, **kwargs)
+            elif in_order:
+                state = RuntimeState()
+                for i in range(state.num_processes):
+                    if i == state.process_idx:
+                        self.logger.log(level, msg, *args, **kwargs)
+                    state.wait_for_everyone()
 
 def get_logger(
     name: str,

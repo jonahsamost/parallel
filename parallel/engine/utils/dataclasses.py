@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import copy
+import torch
 
 
 class DistType(str, Enum):
@@ -10,6 +11,19 @@ class DistType(str, Enum):
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
     FLAM = "FLAM"
+
+
+class RNGType(str, Enum):
+    TORCH = "torch"
+    CUDA = "cuda"
+    GENERATOR = "generator"
+
+TORCH_DISTRIBUTED_OPERATION_TYPES = [
+    x.value for x in [
+        DistType.MULTI_CPU, DistType.MULTI_GPU,
+        DistType.DEEPSPEED, DistType.FSDP, DistType.FLAM
+    ]    
+]
 
 
 @dataclass
@@ -45,3 +59,9 @@ class GradientAccumulationPlugin():
         default_dict = asdict(GradientAccumulationPlugin())
         this_dict = asdict(self)
         return {k: v for k, v in this_dict.items() if default_dict[k] != v}
+
+
+@dataclass
+class TensorInformation:
+    shape: torch.Size
+    dtype: torch.dtype
