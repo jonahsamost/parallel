@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 
 DEFAULT_MASTER_PORT = 29500
 
@@ -92,3 +93,27 @@ def get_allow_cp_standalone():
 
 def get_use_megatron():
     return str_to_bool(os.environ.get("ENGINE_USE_MEGATRON", ""))
+
+
+@contextmanager
+def patch_environment(**kwargs):
+    """
+    A context manager that will add each keyword argument passed to `os.environ` and remove them when exiting.
+    """
+    existing_vars = {}
+    for key, value in kwargs.items():
+        key = key.upper()
+        if key in os.environ:
+            existing_vars[key] = os.environ[key]
+        os.environ[key] = str(value)
+
+    try:
+        yield
+    finally:
+        for key in kwargs:
+            key = key.upper()
+            if key in existing_vars:
+                # restore previous value
+                os.environ[key] = existing_vars[key]
+            else:
+                os.environ.pop(key, None)

@@ -20,6 +20,8 @@ dependencies = [
     "omegaconf",
     "pytest",
     "torchdata",
+    "safetensors",
+    "numpy",
 ]
 
 [tool.setuptools.packages.find]
