@@ -5,6 +5,9 @@ config:
   device_type: "cuda"
   backend: "nccl"
 
+data:
+  dir: "/root/data/"
+
 parallel:
   dp_replicate: 1
   dp_shard: 1

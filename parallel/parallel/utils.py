@@ -4,10 +4,13 @@ from pathlib import Path
 import sys
 from omegaconf import DictConfig, OmegaConf
 from contextlib import contextmanager
+import torch.distributed as dist
 
 
 
-def load_cfg(path: Path) -> DictConfig:
+def load_cfg(path: Path | None = None) -> DictConfig:
+    if path is None:
+        path = Path(__file__).parent / "conf" / "default.yaml"
     base = OmegaConf.load(path)
     assert isinstance(base, DictConfig)
 
@@ -52,3 +55,7 @@ def is_cuda_available():
     with patch_environment(PYTORCH_NVML_BASED_CUDA_CHECK="1"):
         available = torch.cuda.is_available()
     return available
+
+
+def is_dist_initialized():
+    return dist.is_available() and dist.is_initialized()

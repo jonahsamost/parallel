@@ -22,6 +22,7 @@ dependencies = [
     "numpy",
     "accelerate",
     "transformers",
+    "pyarrow",
 ]
 
 [tool.setuptools.packages.find]

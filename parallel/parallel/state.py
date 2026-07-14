@@ -8,6 +8,35 @@ from torch.distributed.device_mesh import init_device_mesh
 from omegaconf import DictConfig, OmegaConf
 
 
+class RuntimeState:
+    _state = {}
+    def __init__(self):
+        if self.initialized:
+            return
+        self._state["RANK"] = int(os.environ.get("RANK", 0))
+        self._state["WORLD_SIZE"] = int(os.environ.get("WORLD_SIZE", 0))
+        self._state["LOCAL_RANK"] = int(os.environ.get("LOCAL_RANK", 0))
+    
+    @property
+    def can_log(self):
+        return self.world_size <= 1 or self.rank == 0
+
+    @property
+    def local_rank(self):
+        return self._state.get("LOCAL_RANK", 0)
+    
+    @property
+    def rank(self):
+        return self._state.get("RANK", 0)
+    
+    @property
+    def world_size(self):
+        return self._state.get("WORLD_SIZE", 0)
+
+    def initialized(self):
+        return self._state != {}    
+
+
 def init_dist(cfg: DictConfig):
     device = cfg.config.device_type
     assert device, "device needs to be set in config"
@@ -106,3 +135,4 @@ class ParallelConfig:
         self.device_mesh = device_mesh
         return self.device_mesh
     
+
