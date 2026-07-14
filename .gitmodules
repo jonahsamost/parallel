@@ -1,4 +1,0 @@
-[submodule "parallel/accelerate"]
-	path = parallel/accelerate
-	url = https://github.com/jonahsamost/accelerate.git
-    branch = parallel

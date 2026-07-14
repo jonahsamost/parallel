@@ -1,14 +1,28 @@
+import os
 from typing import Optional
 from parallel.parallel.utils import is_cuda_available
 import torch
 from dataclasses import dataclass, field
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from omegaconf import DictConfig, OmegaConf
 
 
-@dataclass
-class TopoConfig:
+def init_dist(cfg: DictConfig):
+    device = cfg.config.device_type
+    assert device, "device needs to be set in config"
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if device == "cuda":
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed:
+        if cfg.config.backend == "nccl" and device.type != "cuda":
+            raise RuntimeError("nccl needs to be used with cuda devices")
+        dist.init_process_group(backend=cfg.config.backend)
 
 
 @dataclass
@@ -26,10 +40,25 @@ class ParallelConfig:
     local_rank: int = -1
     world_size: int = -1
 
-    def __post_init__(self):
+    def __init__(self, cfg: DictConfig):
+        conf = cfg.parallel
+        self.dp_replicate_size = conf.dp_replicate
+        self.dp_shard_size = conf.dp_shard
+        self.tp_size = conf.tp
+        self.cp_size = conf.cp
+        self.sp_size = conf.sp
+        self.ep_size = conf.ep
+        self.pp_size = conf.pp
+
         self.rank = dist.get_rank()
         self.local_rank = self.rank % 8
         self.world_size = dist.get_world_size()
+    
+    def is_distributed(self):
+        return self.world_size > 1
+    
+    def is_main_process(self):
+        return self.rank == 0
 
     def __repr__(self):
         return (
@@ -54,13 +83,13 @@ class ParallelConfig:
     
     def get_mesh_dims(self):
         dims = [
-            ("dp_replicate", self.dp),
-            ("dp_shard", self.dp),
-            ("tp", self.tp),
-            ("cp", self.cp),
-            ("sp", self.sp),
-            ("ep", self.ep),
-            ("pp", self.pp),
+            ("dp_replicate", self.dp_replicate_size),
+            ("dp_shard", self.dp_shard_size),
+            ("tp", self.tp_size),
+            ("cp", self.cp_size),
+            ("sp", self.sp_size),
+            ("ep", self.ep_size),
+            ("pp", self.pp_size),
         ]
         dims = [x for x in dims if x[1] > 1]
         return tuple(zip(*dims))

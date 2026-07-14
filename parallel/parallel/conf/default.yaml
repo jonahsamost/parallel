@@ -1,6 +1,10 @@
 model:
   name: "Qwen/Qwen3-30B-A3B"
 
+config:
+  device_type: "cuda"
+  backend: "nccl"
+
 parallel:
   dp_replicate: 1
   dp_shard: 1
