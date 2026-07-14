@@ -1,3 +1,5 @@
+from parallel.parallel.collectives import wait_for_everyone
+import torch
 import os
 import logging
 
@@ -16,7 +18,13 @@ class MultiProcAdapter(logging.LoggerAdapter):
         if self.isEnabledFor(level):
             state = RuntimeState()
             msg, kwargs = self.process(msg, kwargs)
-            if state.can_log:
+            log_all_ranks = kwargs.pop("LOG_ALL_RANKS", False)
+            if log_all_ranks and state.world_size > 1:
+                for i in range(state.world_size):
+                    if i == state.rank:
+                        self.logger.log(level, msg, *args, **kwargs)
+                    wait_for_everyone(state.local_rank)
+            elif state.can_log:
                 self.logger.log(level, msg, *args, **kwargs)
 
 

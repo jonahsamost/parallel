@@ -10,12 +10,13 @@ from omegaconf import DictConfig, OmegaConf
 
 class RuntimeState:
     _state = {}
-    def __init__(self):
+    def __init__(self, backend: str | None = None):
         if self.initialized:
             return
         self._state["RANK"] = int(os.environ.get("RANK", 0))
         self._state["WORLD_SIZE"] = int(os.environ.get("WORLD_SIZE", 0))
         self._state["LOCAL_RANK"] = int(os.environ.get("LOCAL_RANK", 0))
+        self._state["backend"] = backend
     
     @property
     def can_log(self):
@@ -32,6 +33,10 @@ class RuntimeState:
     @property
     def world_size(self):
         return self._state.get("WORLD_SIZE", 0)
+    
+    @property
+    def backend(self):
+        return self._state.get("backend", None)
 
     def initialized(self):
         return self._state != {}    
@@ -64,6 +69,7 @@ class ParallelConfig:
     ep_size: Optional[int] = None
     pp_size: Optional[int] = None
     device_mesh = None
+    device_type = None
 
     rank: int = -1
     local_rank: int = -1
@@ -133,6 +139,7 @@ class ParallelConfig:
             mesh_dim_names=mesh_dim_names,
         )
         self.device_mesh = device_mesh
+        self.device_type = device_type
         return self.device_mesh
     
 

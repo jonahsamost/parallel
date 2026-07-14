@@ -29,7 +29,7 @@ def _create_batches(
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 base_idx = resume_rg_idx // state.world_size
                 base_idx += 1
-                rg_idx = base_idx * state.world_size + state.rank # TODO is this right for > 1 node? 
+                rg_idx = base_idx * state.world_size + state.rank
                 if rg_idx >= pf.num_row_groups:
                     pq_idx += 1
                     continue
@@ -41,7 +41,7 @@ def _create_batches(
                 batch = rg.column("text").to_pylist()
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i: i + tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += state.rank
+                rg_idx += state.world_size
             pq_idx += 1
         first_pass = False
         epoch += 1
@@ -49,23 +49,25 @@ def _create_batches(
 
 def dist_data_loader(
     tokenizer, B, T, split,
-    tokenizer_threads = 4, tokenizer_batch_size=128,
+    tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None, buffer_size=1000,
 ):
     assert split in ["train", "val"], "split must be train/val"
 
     row_capacity = T + 1
     batches = _create_batches(split, resume_state_dict, tokenizer_batch_size)
-    bos_token = tokenizer.get_bos_token_id()
+    bos_token_id = tokenizer.bos_token_id
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
+        encoded = tokenizer(doc_batch, add_special_tokens=False)
+        for token_ids in encoded["input_ids"]:
+            if bos_token_id is not None:
+                token_ids = [bos_token_id] + token_ids
+            doc_buffer.append(token_ids)
     
     use_cuda = device == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
@@ -100,7 +102,7 @@ def dist_data_loader(
                 else:
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx: pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])

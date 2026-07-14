@@ -1,5 +1,15 @@
 model:
   name: "Qwen/Qwen3-30B-A3B"
+  max_seq_length: 2048
+  per_device_batch_size: 4
+  learning_rate: 1e-5
+  use_amp: true
+  amp_dtype: bf16
+
+optim:
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  weight_decay: 0.01
 
 config:
   device_type: "cuda"
