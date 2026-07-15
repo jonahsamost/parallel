@@ -7,12 +7,11 @@ from parallel.utils import DTYPE_DICT
 
 class ParallelEngine:
     def __init__(
-        self, model, tokenizer, pconfig, optimizer, cfg
+        self, model, tokenizer, pconfig, cfg
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.pconfig = pconfig
-        self.optimizer = optimizer
         self.cfg = cfg
 
         self.use_amp = cfg.config.use_amp
@@ -20,6 +19,18 @@ class ParallelEngine:
             assert cfg.config.amp_dtype in ("bf16", "fp16")
         self.amp_dtype = DTYPE_DICT.get(cfg.config.amp_dtype, torch.float32)
         self.grad_scaler = torch.amp.GradScaler(pconfig.device_type, enabled=self.use_amp)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=cfg.model.learning_rate,
+            betas=(cfg.optim.adam_beta1, cfg.optim.adam_beta2),
+            weight_decay=cfg.optim.weight_decay,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+
+    @property
+    def lr(self):
+        return self.optimizer.param_groups[0]['lr']
     
     def forward(self, x, y):
         with torch.autocast(device_type=self.pconfig.device_type, dtype=self.amp_dtype, enabled=self.use_amp):

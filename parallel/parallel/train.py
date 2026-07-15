@@ -47,13 +47,6 @@ def main():
         tokenizer, cfg.model.per_device_batch_size, cfg.model.max_seq_length, split="val"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.model.learning_rate,
-        betas=(cfg.optim.adam_beta1, cfg.optim.adam_beta2),
-        weight_decay=cfg.optim.weight_decay,
-    )
-
     ### train
 
     device = torch.device(pconfig.device_type)
@@ -61,10 +54,9 @@ def main():
     model.train()
     tokens_per_step = cfg.model.per_device_batch_size * pconfig.dp_replicate_size * cfg.model.max_seq_length
     grad_accum_steps = cfg.config.grad_accum_steps
-    optimizer.zero_grad(set_to_none=True)
 
     pengine = ParallelEngine(
-        model, tokenizer, pconfig, optimizer, cfg
+        model, tokenizer, pconfig, cfg
     )
 
     for step in range(1, cfg.config.max_steps + 1):
@@ -85,13 +77,13 @@ def main():
         if pconfig.is_main_process:
             logger.info(
                 f"step {step:6d} | loss {loss_log.item():.4f} "
-                f"| lr {optimizer.param_groups[0]['lr']:.2e} "
+                f"| lr {pengine.lr:.2e} "
                 f"| tok/s {toks_per_sec:,.0f}"
             )
 
         wandb.log({
             "train/loss": loss_log.item(),
-            "opt/lr": optimizer.param_groups[0]["lr"],
+            "opt/lr": pengine.lr,
             "speed/eff_tokens_per_sec": toks_per_sec,
             "step": step,
         }, step=step)
