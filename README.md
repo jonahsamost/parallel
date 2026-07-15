@@ -1,7 +1,7 @@
 ### Roadmap
-- DP / TP / EP / PP / CP axes
+- DP / FSDP / TP / EP / PP / CP axes
+- activation checkpointing
 - comms axes (i.e. DeepEP)
-
 
 ### Would be cool
 - quantization aware training
