@@ -3,7 +3,7 @@ import argparse
 from functools import partial
 import time
 import requests
-from parallel.parallel.utils import load_cfg
+from parallel.utils import load_cfg
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
     print(f"Target directory: {data_dir}")
     print()
-    func = partial(download_single_file, data_dir=data_dir)
+    func = partial(download_single_file, data_dir)
     with Pool(processes=args.num_workers) as pool:
         results = pool.map(func, ids_to_download)
 

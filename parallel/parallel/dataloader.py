@@ -1,8 +1,8 @@
-from parallel.parallel.dataset import list_data_files
+from parallel.dataset import list_data_files
 import torch
 import pyarrow.parquet as pq
 
-from parallel.parallel.state import RuntimeState
+from parallel.state import RuntimeState
 
 def _create_batches(
     split: str,

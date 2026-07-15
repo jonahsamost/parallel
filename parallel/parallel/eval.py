@@ -23,12 +23,12 @@ def eval_bpb(
     model.eval()
     token_bytes = token_bytes.to(device)
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
-    total_bytes = torch.tensor(0.0, dtype=torch.int64, device=device)
+    total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
 
     for _ in range(eval_steps):
-        x, y = next(dataloader)
+        x, y, _ = next(dataloader)
         with torch.autocast(device_type=pconfig.device_type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(x)
+            logits = model(input_ids=x).logits
         loss_per_token = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             y.view(-1),
@@ -46,5 +46,5 @@ def eval_bpb(
     model.train()
     total_bytes_val = total_bytes.item()
     if total_bytes_val == 0:
-        return float("int")
+        return float("inf")
     return total_nats.item() / (math.log(2) * total_bytes_val)

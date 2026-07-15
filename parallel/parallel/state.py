@@ -1,7 +1,7 @@
 import os
 from enum import Enum
 from typing import Optional
-from parallel.parallel.utils import is_cuda_available, is_dist_initialized
+from parallel.utils import is_cuda_available, is_dist_initialized
 import torch
 from dataclasses import dataclass, field
 import torch.distributed as dist
@@ -49,6 +49,7 @@ class RuntimeState:
     def backend(self):
         return self._state.get("backend", None)
 
+    @property
     def initialized(self):
         return self._state != {}    
 
@@ -96,9 +97,9 @@ class ParallelConfig:
         self.ep_size = conf.ep
         self.pp_size = conf.pp
 
-        self.rank = dist.get_rank()
-        self.local_rank = self.rank % 8
-        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank() if is_dist_initialized() else 0
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = dist.get_world_size() if is_dist_initialized() else 1
 
         if self.world_size > 1:
             assert is_dist_initialized()
@@ -154,8 +155,11 @@ class ParallelConfig:
         return tuple(zip(*dims))
     
     def set_device_mesh(self, device_type: str):
+        self.device_type = device_type
         dims = self.get_mesh_dims()
-        assert len(dims) > 0, "Mesh dims length == 0"
+        if len(dims) == 0:
+            self.device_mesh = None
+            return None
         mesh_dim_names, mesh_shape = dims
         device_mesh = init_device_mesh(
             device_type,
@@ -163,6 +167,5 @@ class ParallelConfig:
             mesh_dim_names=mesh_dim_names,
         )
         self.device_mesh = device_mesh
-        self.device_type = device_type
         return self.device_mesh
     

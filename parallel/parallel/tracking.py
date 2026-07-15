@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 
-from parallel.parallel.logging import get_logger
+from parallel.logging import get_logger
 
 
 logger = get_logger(__name__)
@@ -11,7 +11,6 @@ class WandBTracker:
         self.rank = rank
         self.project_name = project_name
         self.init_kwargs = kwargs
-        assert os.environ.get("WANDB_API_KEY")
     
     @property
     def is_main_rank(self):
@@ -19,6 +18,7 @@ class WandBTracker:
     
     def start(self):
         if self.is_main_rank:
+            assert os.environ.get("WANDB_API_KEY"), "WANDB_API_KEY must be set"
             import wandb
             self.run = wandb.init(project=self.project_name, **self.init_kwargs)
             logger.debug("initialized wandb")

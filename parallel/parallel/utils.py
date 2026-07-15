@@ -96,8 +96,8 @@ def model_init_rngs(pconfig: ParallelConfig, seed: int = 42):
 
 def model_train_rngs(pconfig: ParallelConfig, seed: int = 42):
     """
-    - DP ranks get same seed
-    - TP ranks within same (DP/PP) group get same seedvv      
+    - DP ranks get different seeds (each sees different data)
+    - TP ranks within same (DP/PP) group get same seed
     """
     dp_rank = _mesh_rank(pconfig, Strategies.DP_REPLICATE)
     pp_rank = _mesh_rank(pconfig, Strategies.PP)

@@ -34,7 +34,7 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name,)
     logger.info("Collecting token bytes...")
-    token_bytes = get_token_bytes()
+    token_bytes = get_token_bytes(tokenizer)
 
     logger.info("Model loaded. Compiling...")
     model = torch.compile(model)
@@ -60,7 +60,7 @@ def main():
     use_amp = cfg.config.use_amp
     if use_amp:
         assert cfg.config.amp_dtype in ("bf16", "fp16")
-    amp_dtype = DTYPE_DICT.get(cfg.config.amp_dtype, "")
+    amp_dtype = DTYPE_DICT.get(cfg.config.amp_dtype, torch.float32)
     grad_scaler = torch.amp.GradScaler(pconfig.device_type, enabled=use_amp)
 
     ### train
@@ -68,7 +68,7 @@ def main():
     device = torch.device(pconfig.device_type)
     model.to(device)
     model.train()
-    tokens_per_step = cfg.config.per_device_batch_size * pconfig.dp_replicate_size * cfg.config.max_seq_length
+    tokens_per_step = cfg.model.per_device_batch_size * pconfig.dp_replicate_size * cfg.model.max_seq_length
     grad_accum_steps = cfg.config.grad_accum_steps
     optimizer.zero_grad(set_to_none=True)
 
@@ -76,9 +76,9 @@ def main():
         step_start = time.time()
         total_loss = torch.tensor(0.0, device=device)
         for _ in range(grad_accum_steps):
-            x, y = next(train_dataloader)
+            x, y, _ = next(train_dataloader)
             with torch.autocast(device_type=pconfig.device_type, dtype=amp_dtype, enabled=use_amp):
-                loss = model(x, y) / grad_accum_steps
+                loss = model(input_ids=x, labels=y).loss / grad_accum_steps
 
             if grad_scaler.is_enabled():
                 grad_scaler.scale(loss).backward()
@@ -89,11 +89,10 @@ def main():
         if grad_scaler.is_enabled():
             grad_scaler.unscale_(optimizer)
 
-        communicate_rank_loss(loss_log, pconfig)
         average_gradients(model, pconfig)
 
-        if cfg.config.clip_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.config.clip_norm)
+        if cfg.model.clip_grad_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.model.clip_grad_norm)
 
         if grad_scaler.is_enabled():
             grad_scaler.step(optimizer)
@@ -101,7 +100,9 @@ def main():
         else:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
         loss_log = total_loss.float()
+        communicate_rank_loss(loss_log, pconfig)
 
         now = time.time()
         dt = now - step_start
