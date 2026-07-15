@@ -1,16 +1,14 @@
 from omegaconf import OmegaConf
 import time
+from parallel.parallel.engine.engine import ParallelEngine
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch.distributed as dist
-
 from parallel.eval import eval_bpb, get_token_bytes
-from parallel.strategies.dp import average_gradients, communicate_rank_loss
 from parallel.dataloader import dist_data_loader
 from parallel.logging import get_logger
 from parallel.tracking import WandBTracker
-from parallel.state import ParallelConfig, RuntimeState, Strategies, init_dist
-from parallel.utils import DTYPE_DICT, dist_cleanup, is_dist_initialized, load_cfg, model_init_rngs, model_train_rngs
+from parallel.state import ParallelConfig, RuntimeState, init_dist
+from parallel.utils import dist_cleanup, load_cfg, model_init_rngs, model_train_rngs
 
 logger = get_logger(__name__)
 
@@ -56,13 +54,6 @@ def main():
         weight_decay=cfg.optim.weight_decay,
     )
 
-    ### mixed precision
-    use_amp = cfg.config.use_amp
-    if use_amp:
-        assert cfg.config.amp_dtype in ("bf16", "fp16")
-    amp_dtype = DTYPE_DICT.get(cfg.config.amp_dtype, torch.float32)
-    grad_scaler = torch.amp.GradScaler(pconfig.device_type, enabled=use_amp)
-
     ### train
 
     device = torch.device(pconfig.device_type)
@@ -72,37 +63,21 @@ def main():
     grad_accum_steps = cfg.config.grad_accum_steps
     optimizer.zero_grad(set_to_none=True)
 
+    pengine = ParallelEngine(
+        model, tokenizer, pconfig, optimizer, cfg
+    )
+
     for step in range(1, cfg.config.max_steps + 1):
         step_start = time.time()
         total_loss = torch.tensor(0.0, device=device)
         for _ in range(grad_accum_steps):
             x, y, _ = next(train_dataloader)
-            with torch.autocast(device_type=pconfig.device_type, dtype=amp_dtype, enabled=use_amp):
-                loss = model(input_ids=x, labels=y).loss / grad_accum_steps
-
-            if grad_scaler.is_enabled():
-                grad_scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss = pengine.forward(x, y).loss / grad_accum_steps
+            pengine.backward(loss)
             total_loss += loss.detach() 
         
-        if grad_scaler.is_enabled():
-            grad_scaler.unscale_(optimizer)
-
-        average_gradients(model, pconfig)
-
-        if cfg.model.clip_grad_norm > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.model.clip_grad_norm)
-
-        if grad_scaler.is_enabled():
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        loss_log = total_loss.float()
-        communicate_rank_loss(loss_log, pconfig)
+        pengine.step()
+        loss_log = pengine.reduce_loss(total_loss)
 
         now = time.time()
         dt = now - step_start
@@ -125,7 +100,7 @@ def main():
             logger.info("Evaling...")
             bpb = eval_bpb(
                 model, eval_dataloader, cfg.config.eval_steps,
-                device, pconfig, use_amp, amp_dtype, token_bytes
+                device, pconfig, pengine.use_amp, pengine.amp_dtype, token_bytes
             )
             wandb.log({"eval/loss": bpb, "step": step}, step=step)
     
