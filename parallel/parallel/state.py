@@ -1,11 +1,22 @@
 import os
+from enum import Enum
 from typing import Optional
-from parallel.parallel.utils import is_cuda_available
+from parallel.parallel.utils import is_cuda_available, is_dist_initialized
 import torch
 from dataclasses import dataclass, field
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from omegaconf import DictConfig, OmegaConf
+
+
+class Strategies(str, Enum):
+    DP_REPLICATE = "dp_replicate"
+    DP_SHARD = "dp_shard"
+    TP = "tp"
+    CP = "cp"
+    SP = "sp"
+    EP = "ep"
+    PP = "pp"
 
 
 class RuntimeState:
@@ -88,10 +99,23 @@ class ParallelConfig:
         self.rank = dist.get_rank()
         self.local_rank = self.rank % 8
         self.world_size = dist.get_world_size()
+
+        if self.world_size > 1:
+            assert is_dist_initialized()
     
+    @property
+    def dp_size(self):
+        return self.dp_replicate_size * self.dp_shard_size
+    
+    @property
+    def dp_enabled(self):
+        return self.dp_size > 1
+    
+    @property
     def is_distributed(self):
         return self.world_size > 1
     
+    @property
     def is_main_process(self):
         return self.rank == 0
 
@@ -118,13 +142,13 @@ class ParallelConfig:
     
     def get_mesh_dims(self):
         dims = [
-            ("dp_replicate", self.dp_replicate_size),
-            ("dp_shard", self.dp_shard_size),
-            ("tp", self.tp_size),
-            ("cp", self.cp_size),
-            ("sp", self.sp_size),
-            ("ep", self.ep_size),
-            ("pp", self.pp_size),
+            (Strategies.DP_REPLICATE, self.dp_replicate_size),
+            (Strategies.DP_SHARD, self.dp_shard_size),
+            (Strategies.TP, self.tp_size),
+            (Strategies.CP, self.cp_size),
+            (Strategies.SP, self.sp_size),
+            (Strategies.EP, self.ep_size),
+            (Strategies.PP, self.pp_size),
         ]
         dims = [x for x in dims if x[1] > 1]
         return tuple(zip(*dims))
@@ -142,4 +166,3 @@ class ParallelConfig:
         self.device_type = device_type
         return self.device_mesh
     
-

@@ -1,6 +1,5 @@
 import random
 import numpy as np
-from parallel.parallel.state import ParallelConfig, RuntimeState
 import torch
 import os
 from pathlib import Path
@@ -9,7 +8,15 @@ from omegaconf import DictConfig, OmegaConf
 from contextlib import contextmanager
 import torch.distributed as dist
 
+from parallel.state import ParallelConfig, RuntimeState, Strategies
 
+DTYPE_DICT = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+def empty_fn(*args, **kwargs):
+    pass
 
 def load_cfg(path: Path | None = None) -> DictConfig:
     if path is None:
@@ -64,6 +71,12 @@ def is_dist_initialized():
     return dist.is_available() and dist.is_initialized()
 
 
+def dist_cleanup():
+    if is_dist_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
 def _mesh_rank(pconfig: ParallelConfig, dim_name: str) -> int:
     if pconfig.device_mesh is not None and dim_name in pconfig.device_mesh.mesh_dim_names:
         return pconfig.device_mesh.get_local_rank(dim_name)
@@ -74,7 +87,7 @@ def model_init_rngs(pconfig: ParallelConfig, seed: int = 42):
     """
     different rank TP get different seeds
     """
-    tp_rank = _mesh_rank(pconfig, "tp")
+    tp_rank = _mesh_rank(pconfig, Strategies.TP)
     init_seed = seed + tp_rank
     torch.manual_seed(init_seed)
     if pconfig.device_type == "cuda":
@@ -86,8 +99,8 @@ def model_train_rngs(pconfig: ParallelConfig, seed: int = 42):
     - DP ranks get same seed
     - TP ranks within same (DP/PP) group get same seedvv      
     """
-    dp_rank = _mesh_rank(pconfig, "dp_replicate")
-    pp_rank = _mesh_rank(pconfig, "pp")
+    dp_rank = _mesh_rank(pconfig, Strategies.DP_REPLICATE)
+    pp_rank = _mesh_rank(pconfig, Strategies.PP)
 
     data_seed = seed + dp_rank
     random.seed(data_seed)
