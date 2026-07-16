@@ -1,17 +1,21 @@
-from parallel.dataset import list_data_files
 import torch
 import pyarrow.parquet as pq
 
-from parallel.state import RuntimeState
+from .dataset import list_data_files
+from .state import ParallelConfig
 
 def _create_batches(
     split: str,
     resume_state_dict: dict,
     tokenizer_batch_size: int,
+    data_rank: int,
+    data_world_size: int,
 ):
-    state = RuntimeState()
     file_paths = list_data_files()
-    assert len(file_paths) != 0, "No data found. please run dataset.py"
+    if not file_paths:
+        raise RuntimeError("No data found; run dataset.py first")
+    if split == "train" and len(file_paths) < 2:
+        raise RuntimeError("Training requires at least two data files because the final file is reserved for validation")
     file_paths = file_paths[:-1] if split == "train" else file_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
@@ -27,21 +31,21 @@ def _create_batches(
             filepath = file_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                base_idx = resume_rg_idx // state.world_size
+                base_idx = resume_rg_idx // data_world_size
                 base_idx += 1
-                rg_idx = base_idx * state.world_size + state.rank
+                rg_idx = base_idx * data_world_size + data_rank
                 if rg_idx >= pf.num_row_groups:
                     pq_idx += 1
                     continue
                 resume_rg_idx = None
             else:
-                rg_idx = state.rank
+                rg_idx = data_rank
             while rg_idx < pf.num_row_groups:
                 rg = pf.read_row_group(rg_idx)
                 batch = rg.column("text").to_pylist()
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i: i + tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += state.world_size
+                rg_idx += data_world_size
             pq_idx += 1
         first_pass = False
         epoch += 1
@@ -51,11 +55,20 @@ def dist_data_loader(
     tokenizer, B, T, split,
     tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None, buffer_size=1000,
+    pconfig: ParallelConfig | None = None,
 ):
     assert split in ["train", "val"], "split must be train/val"
 
     row_capacity = T + 1
-    batches = _create_batches(split, resume_state_dict, tokenizer_batch_size)
+    data_rank = pconfig.data_rank if pconfig is not None else 0
+    data_world_size = pconfig.data_world_size if pconfig is not None else 1
+    batches = _create_batches(
+        split,
+        resume_state_dict,
+        tokenizer_batch_size,
+        data_rank,
+        data_world_size,
+    )
     bos_token_id = tokenizer.bos_token_id
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
@@ -69,7 +82,7 @@ def dist_data_loader(
                 token_ids = [bos_token_id] + token_ids
             doc_buffer.append(token_ids)
     
-    use_cuda = device == "cuda"
+    use_cuda = torch.device(device).type == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer

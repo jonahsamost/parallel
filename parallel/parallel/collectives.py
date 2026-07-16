@@ -1,5 +1,6 @@
-from parallel.state import RuntimeState
 import torch
+
+from .state import RuntimeState
 
 def wait_for_everyone(state: RuntimeState):
     if state.backend == "nccl":

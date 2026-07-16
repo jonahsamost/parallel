@@ -3,7 +3,7 @@ import argparse
 from functools import partial
 import time
 import requests
-from parallel.utils import load_cfg
+from .utils import load_cfg
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 

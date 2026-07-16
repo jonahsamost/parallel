@@ -25,6 +25,9 @@ dependencies = [
     "pyarrow",
 ]
 
+[project.scripts]
+parallel-train = "parallel.parallel.train:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["parallel*"]

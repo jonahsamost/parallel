@@ -8,7 +8,6 @@ from omegaconf import DictConfig, OmegaConf
 from contextlib import contextmanager
 import torch.distributed as dist
 
-from parallel.state import ParallelConfig, RuntimeState, Strategies
 
 DTYPE_DICT = {
     "bf16": torch.bfloat16,
@@ -75,38 +74,3 @@ def dist_cleanup():
     if is_dist_initialized():
         dist.barrier()
         dist.destroy_process_group()
-
-
-def _mesh_rank(pconfig: ParallelConfig, dim_name: str) -> int:
-    if pconfig.device_mesh is not None and dim_name in pconfig.device_mesh.mesh_dim_names:
-        return pconfig.device_mesh.get_local_rank(dim_name)
-    return 0
-
-
-def model_init_rngs(pconfig: ParallelConfig, seed: int = 42):
-    """
-    different rank TP get different seeds
-    """
-    tp_rank = _mesh_rank(pconfig, Strategies.TP)
-    init_seed = seed + tp_rank
-    torch.manual_seed(init_seed)
-    if pconfig.device_type == "cuda":
-        torch.cuda.manual_seed_all(init_seed)
-
-
-def model_train_rngs(pconfig: ParallelConfig, seed: int = 42):
-    """
-    - DP ranks get different seeds (each sees different data)
-    - TP ranks within same (DP/PP) group get same seed
-    """
-    dp_rank = _mesh_rank(pconfig, Strategies.DP_REPLICATE)
-    pp_rank = _mesh_rank(pconfig, Strategies.PP)
-
-    data_seed = seed + dp_rank
-    random.seed(data_seed)
-    np.random.seed(data_seed)
-
-    torch_seed = seed + dp_rank * 1000 + pp_rank
-    torch.manual_seed(torch_seed)
-    if pconfig.device_type == "cuda":
-        torch.cuda.manual_seed_all(torch_seed)

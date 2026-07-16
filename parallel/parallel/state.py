@@ -1,12 +1,15 @@
+import random
+import numpy as np
 import os
 from enum import Enum
 from typing import Optional
-from parallel.utils import is_cuda_available, is_dist_initialized
 import torch
 from dataclasses import dataclass, field
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from omegaconf import DictConfig, OmegaConf
+
+from .utils import is_dist_initialized
 
 
 class Strategies(str, Enum):
@@ -25,7 +28,7 @@ class RuntimeState:
         if self.initialized:
             return
         self._state["RANK"] = int(os.environ.get("RANK", 0))
-        self._state["WORLD_SIZE"] = int(os.environ.get("WORLD_SIZE", 0))
+        self._state["WORLD_SIZE"] = int(os.environ.get("WORLD_SIZE", 1))
         self._state["LOCAL_RANK"] = int(os.environ.get("LOCAL_RANK", 0))
         self._state["backend"] = backend
     
@@ -43,7 +46,7 @@ class RuntimeState:
     
     @property
     def world_size(self):
-        return self._state.get("WORLD_SIZE", 0)
+        return self._state.get("WORLD_SIZE", 1)
     
     @property
     def backend(self):
@@ -59,6 +62,7 @@ def init_dist(cfg: DictConfig):
     assert device, "device needs to be set in config"
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if device == "cuda":
+        torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")
@@ -101,8 +105,30 @@ class ParallelConfig:
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if is_dist_initialized() else 1
 
+        self._device = None
+
         if self.world_size > 1:
             assert is_dist_initialized()
+
+        sizes = {
+            "dp_replicate": self.dp_replicate_size,
+            "dp_shard": self.dp_shard_size,
+            "tp": self.tp_size,
+            "cp": self.cp_size,
+            "sp": self.sp_size,
+            "ep": self.ep_size,
+            "pp": self.pp_size,
+        }
+        invalid = {name: size for name, size in sizes.items() if not isinstance(size, int) or size < 1}
+        if invalid:
+            raise ValueError(f"Parallel dimensions must be positive integers: {invalid}")
+        if self.total_size != self.world_size:
+            raise ValueError(
+                f"Parallel mesh size {self.total_size} does not match distributed world size {self.world_size}"
+            )
+        unsupported = {name: size for name, size in sizes.items() if name not in {"dp_replicate", "dp_shard"} and size > 1}
+        if unsupported:
+            raise NotImplementedError(f"Only replicated and sharded data parallelism are implemented: {unsupported}")
     
     @property
     def dp_size(self):
@@ -119,6 +145,16 @@ class ParallelConfig:
     @property
     def is_main_process(self):
         return self.rank == 0
+
+    @property
+    def data_rank(self):
+        if self.device_mesh is not None and Strategies.DP_REPLICATE in self.device_mesh.mesh_dim_names:
+            return self.device_mesh.get_local_rank(Strategies.DP_REPLICATE)
+        return 0
+
+    @property
+    def data_world_size(self):
+        return self.dp_replicate_size
 
     def __repr__(self):
         return (
@@ -169,3 +205,43 @@ class ParallelConfig:
         self.device_mesh = device_mesh
         return self.device_mesh
     
+    def device(self):
+        if self._device is not None:
+            return self._device
+        if self.device_type == "cuda":
+            self._device = torch.device("cuda", self.local_rank)
+        else:
+            self._device = torch.device("cpu")
+        return self._device
+
+    def _mesh_rank(self, dim_name: str) -> int:
+        if self.device_mesh is not None and dim_name in self.device_mesh.mesh_dim_names:
+            return self.device_mesh.get_local_rank(dim_name)
+        return 0
+
+    def model_init_rngs(self, seed: int = 42):
+        """
+        different rank TP get different seeds
+        """
+        tp_rank = self._mesh_rank(Strategies.TP)
+        init_seed = seed + tp_rank
+        torch.manual_seed(init_seed)
+        if self.device_type == "cuda":
+            torch.cuda.manual_seed_all(init_seed)
+
+    def model_train_rngs(self, seed: int = 42):
+        """
+        - DP ranks get different seeds (each sees different data)
+        - TP ranks within same (DP/PP) group get same seed
+        """
+        dp_rank = self._mesh_rank(Strategies.DP_REPLICATE)
+        pp_rank = self._mesh_rank(Strategies.PP)
+
+        data_seed = seed + dp_rank
+        random.seed(data_seed)
+        np.random.seed(data_seed)
+
+        torch_seed = seed + dp_rank * 1000 + pp_rank
+        torch.manual_seed(torch_seed)
+        if self.device_type == "cuda":
+            torch.cuda.manual_seed_all(torch_seed)

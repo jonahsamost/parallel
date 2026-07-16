@@ -20,6 +20,13 @@ config:
   eval_interval: 10
   eval_steps: 10
 
+engine:
+  cpu_offload: false
+  activation_checkpoint: false
+  checkpoint_every_n: 1
+  compile: false
+
+
 data:
   dir: "/root/data/"
 

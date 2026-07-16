@@ -1,9 +1,9 @@
-from parallel.collectives import wait_for_everyone
 import torch
 import os
 import logging
 
-from parallel.state import RuntimeState
+from .collectives import wait_for_everyone
+from .state import RuntimeState
 
 class MultiProcAdapter(logging.LoggerAdapter):
     

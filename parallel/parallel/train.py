@@ -1,14 +1,15 @@
 from omegaconf import OmegaConf
 import time
-from parallel.parallel.engine.engine import ParallelEngine
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from parallel.eval import eval_bpb, get_token_bytes
-from parallel.dataloader import dist_data_loader
-from parallel.logging import get_logger
-from parallel.tracking import WandBTracker
-from parallel.state import ParallelConfig, RuntimeState, init_dist
-from parallel.utils import dist_cleanup, load_cfg, model_init_rngs, model_train_rngs
+
+from .dataloader import dist_data_loader
+from .engine.engine import ParallelEngine
+from .eval import eval_bpb, get_token_bytes
+from .logging import get_logger
+from .state import ParallelConfig, RuntimeState, init_dist
+from .tracking import WandBTracker
+from .utils import dist_cleanup, load_cfg, model_init_rngs, model_train_rngs
 
 logger = get_logger(__name__)
 
@@ -18,12 +19,13 @@ def main():
     init_dist(cfg)
     pconfig = ParallelConfig(cfg)
     pconfig.set_device_mesh(cfg.config.device_type)
+    device = pconfig.device
     wandb = WandBTracker(rank=pconfig.rank)
     wandb.start()
     wandb.store_init_config(OmegaConf.to_container(cfg, resolve=True))
 
     ### rngs
-    model_init_rngs(pconfig, seed=cfg.get("seed", 42))
+    pconfig.model_init_rngs(seed=cfg.get("seed", 42))
 
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.name,
@@ -34,29 +36,41 @@ def main():
     logger.info("Collecting token bytes...")
     token_bytes = get_token_bytes(tokenizer)
 
-    logger.info("Model loaded. Compiling...")
-    model = torch.compile(model)
-    logger.info("Model compiled")
-
-    model_train_rngs(pconfig, seed=cfg.get("seed", 42))
+    pconfig.model_train_rngs(seed=cfg.get("seed", 42))
 
     train_dataloader = dist_data_loader(
-        tokenizer, cfg.model.per_device_batch_size, cfg.model.max_seq_length, split="train"
+        tokenizer,
+        cfg.model.per_device_batch_size,
+        cfg.model.max_seq_length,
+        split="train",
+        device=device,
+        pconfig=pconfig,
     )
     eval_dataloader = dist_data_loader(
-        tokenizer, cfg.model.per_device_batch_size, cfg.model.max_seq_length, split="val"
+        tokenizer,
+        cfg.model.per_device_batch_size,
+        cfg.model.max_seq_length,
+        split="val",
+        device=device,
+        pconfig=pconfig,
     )
 
     ### train
 
-    device = torch.device(pconfig.device_type)
-    model.to(device)
+    if pconfig.dp_shard_size <= 1:
+        model.to(device)
+    if cfg.engine.compile:
+        if pconfig.dp_shard_size > 1:
+            raise NotImplementedError("torch.compile is not yet supported with the custom FSDP implementation")
+        logger.info("Model loaded. Compiling...")
+        model = torch.compile(model)
+        logger.info("Model compiled")
     model.train()
     tokens_per_step = cfg.model.per_device_batch_size * pconfig.dp_replicate_size * cfg.model.max_seq_length
     grad_accum_steps = cfg.config.grad_accum_steps
 
     pengine = ParallelEngine(
-        model, tokenizer, pconfig, cfg
+        model, tokenizer, pconfig, cfg, device
     )
 
     for step in range(1, cfg.config.max_steps + 1):
@@ -90,6 +104,7 @@ def main():
 
         if step % cfg.config.eval_interval == 0 or step == cfg.config.max_steps:
             logger.info("Evaling...")
+            pengine.sync_buffers()
             bpb = eval_bpb(
                 model, eval_dataloader, cfg.config.eval_steps,
                 device, pconfig, pengine.use_amp, pengine.amp_dtype, token_bytes
