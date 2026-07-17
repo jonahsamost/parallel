@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Sequence
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -74,7 +74,16 @@ class DPParamUnit:
         self._full_params_buf: Optional[torch.Tensor] = None
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
         self._post_accumulate_handles: list[torch.utils.hooks.RemovableHook] = []
+        self._expected_grad_param_ids: Optional[set[int]] = None
         self._post_accumulated_param_ids: set[int] = set()
+        self._backward_ready_callback: Optional[Callable[[DPParamUnit], None]] = None
+        self._backward_ready_notified: bool = False
+        self._gradient_reduction_started: bool = False
+        self._gradient_reduction_finished: bool = False
+        self._local_gradient_participated: Optional[bool] = None
+        self._reduction_work = None
+        self._pending_grad_buf: Optional[torch.Tensor] = None
+        self._pending_shard_grad: Optional[torch.Tensor] = None
         self._original_forward = None
 
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
@@ -197,12 +206,22 @@ class DPParamUnit:
         self._replace_params_with_placeholders()
         self._full_params_buf = None
 
-    def reduce_scatter_grads(self, accumulate: bool = True):
-        """Flatten all grads -> pad -> reduce-scatter -> each rank keeps its shard grad."""
+    def start_gradient_reduction(self):
+        """Launch this unit's reduce-scatter asynchronously."""
         if not self.requires_grad:
             raise RuntimeError("Frozen parameter units do not have gradients to reduce")
         if self.flat_shard is None:
             raise RuntimeError("Cannot reduce-scatter before sharding")
+        if self._gradient_reduction_started:
+            raise RuntimeError(
+                f"Gradient reduction already started for FSDP unit {self.unit_index}"
+            )
+        if self._expected_grad_param_ids is None:
+            raise RuntimeError(
+                f"FSDP unit {self.unit_index} was not prepared for backward"
+            )
+
+        local_participated = bool(self._expected_grad_param_ids)
         grad_buf = torch.zeros(
             self.padded_numel, dtype=self.flat_shard.dtype, device=self.device
         )
@@ -213,37 +232,129 @@ class DPParamUnit:
         shard_grad = torch.empty(
             self.chunk_size, dtype=grad_buf.dtype, device=self.device
         )
-        dist.reduce_scatter_tensor(
-            shard_grad, grad_buf, op=dist.ReduceOp.SUM, group=self.group
+        reduction_work = dist.reduce_scatter_tensor(
+            shard_grad,
+            grad_buf,
+            op=dist.ReduceOp.SUM,
+            group=self.group,
+            async_op=True,
         )
-        shard_grad.div_(self.world_size)
-
-        if self.cpu_offload:
-            shard_grad = shard_grad.to("cpu")
-
-        if accumulate:
-            if self.flat_shard.grad is None:
-                self.flat_shard.grad = shard_grad
-            else:
-                self.flat_shard.grad.add_(shard_grad)
 
         for meta in self.param_metas:
             meta.parameter.grad = None
-
-    def finalize_backward(self):
-        """Reduce gradients after autograd has finalized every parameter gradient."""
-        if not self.requires_grad:
-            self.free_full_params()
-            return
-        local_participated = any(meta.parameter.grad is not None for meta in self.param_metas)
-        participated = torch.tensor(
-            int(local_participated),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        dist.all_reduce(participated, op=dist.ReduceOp.MAX, group=self.group)
-        self.reduce_scatter_grads(accumulate=bool(participated.item()))
         self.free_full_params()
+
+        # Keep the collective input and output alive until the asynchronous work
+        # has completed. The wrapper waits for it before returning from
+        # finalize_backward(), so the optimizer never observes an in-flight grad.
+        self._local_gradient_participated = local_participated
+        self._reduction_work = reduction_work
+        self._pending_grad_buf = grad_buf
+        self._pending_shard_grad = shard_grad
+        self._gradient_reduction_started = True
+
+    def finish_gradient_reduction(self):
+        """Wait for reduce-scatter and release its full-sized input buffer."""
+        if not self._gradient_reduction_started:
+            return
+        if self._gradient_reduction_finished:
+            return
+        if (
+            self._local_gradient_participated is None
+            or self._reduction_work is None
+            or self._pending_shard_grad is None
+        ):
+            raise RuntimeError(
+                f"Incomplete reduction state for FSDP unit {self.unit_index}"
+            )
+
+        self._reduction_work.wait()
+        self._pending_shard_grad.div_(self.world_size)
+        if self.cpu_offload:
+            self._pending_shard_grad = self._pending_shard_grad.to("cpu")
+        self._reduction_work = None
+        self._pending_grad_buf = None
+        self._gradient_reduction_finished = True
+
+    def accumulate_reduced_gradient(self, accumulate: bool):
+        """Accumulate the completed local shard once global participation is known."""
+        self.finish_gradient_reduction()
+        if self._pending_shard_grad is None:
+            raise RuntimeError(
+                f"Missing reduced gradient for FSDP unit {self.unit_index}"
+            )
+        if accumulate:
+            if self.flat_shard.grad is None:
+                self.flat_shard.grad = self._pending_shard_grad
+            else:
+                self.flat_shard.grad.add_(self._pending_shard_grad)
+
+        self._local_gradient_participated = None
+        self._pending_shard_grad = None
+
+    def reset_backward_state(self):
+        """Prepare hook bookkeeping for the next backward invocation."""
+        if self._gradient_reduction_started and self._reduction_work is not None:
+            raise RuntimeError(
+                f"Cannot reset FSDP unit {self.unit_index} with an in-flight reduction"
+            )
+        self._expected_grad_param_ids = None
+        self._post_accumulated_param_ids.clear()
+        self._backward_ready_notified = False
+        self._gradient_reduction_started = False
+        self._gradient_reduction_finished = False
+
+    @property
+    def local_gradient_participated(self) -> bool:
+        if self._local_gradient_participated is None:
+            raise RuntimeError(
+                f"Gradient reduction has not started for FSDP unit {self.unit_index}"
+            )
+        return self._local_gradient_participated
+
+    def set_backward_ready_callback(
+        self, callback: Callable[[DPParamUnit], None]
+    ) -> None:
+        self._backward_ready_callback = callback
+
+    def prepare_backward(self, used_param_ids: set[int]) -> bool:
+        """Record which local parameters autograd will visit in this backward."""
+        if self._expected_grad_param_ids is not None:
+            raise RuntimeError(
+                f"FSDP unit {self.unit_index} is already prepared for backward"
+            )
+        if self._gradient_reduction_started:
+            raise RuntimeError(
+                f"FSDP unit {self.unit_index} still has reduction state from backward"
+            )
+        self._expected_grad_param_ids = {
+            id(parameter)
+            for parameter in self._params
+            if id(parameter) in used_param_ids
+        }
+        if not self._expected_grad_param_ids:
+            self.free_full_params()
+            self._backward_ready_notified = True
+            return True
+        return False
+
+    @property
+    def backward_ready(self) -> bool:
+        return self._backward_ready_notified
+
+    @property
+    def parameter_ids(self) -> set[int]:
+        return {id(parameter) for parameter in self._params}
+
+    def missing_expected_grad_names(self) -> list[str]:
+        if self._expected_grad_param_ids is None:
+            return [name for name, _ in self._named_params]
+        return [
+            name
+            for name, parameter in self._named_params
+            if id(parameter) in self._expected_grad_param_ids
+            and id(parameter) not in self._post_accumulated_param_ids
+        ]
 
     # Prefetching
 
@@ -255,6 +366,8 @@ class DPParamUnit:
             self.all_gather()
             return
 
+        current_stream = torch.cuda.current_stream(self.device)
+        self._prefetch_stream.wait_stream(current_stream)
         with torch.cuda.stream(self._prefetch_stream):
             self.all_gather()
             self._prefetch_event = torch.cuda.Event()
@@ -295,7 +408,6 @@ class DPParamUnit:
     def _pre_fwd_hook(self, module, args):
         if self._is_in_backward:
             return args
-        self._post_accumulated_param_ids.clear()
         self.wait_for_prefetch()
         self.all_gather()
         self._prefetch_next_forward()
@@ -320,9 +432,19 @@ class DPParamUnit:
         self._is_in_backward = False
 
     def _post_accumulate_grad_hook(self, parameter):
+        if self._expected_grad_param_ids is None:
+            raise RuntimeError(
+                "FSDP backward started without calling prepare_backward(loss)"
+            )
         self._post_accumulated_param_ids.add(id(parameter))
-        if len(self._post_accumulated_param_ids) == len(self._params):
+        if (
+            self._expected_grad_param_ids <= self._post_accumulated_param_ids
+            and not self._backward_ready_notified
+        ):
+            self._backward_ready_notified = True
             self.free_full_params()
+            if self._backward_ready_callback is not None:
+                self._backward_ready_callback(self)
 
     # Activation checkpointing
 

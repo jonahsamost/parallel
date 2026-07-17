@@ -148,13 +148,13 @@ class ParallelConfig:
 
     @property
     def data_rank(self):
-        if self.device_mesh is not None and Strategies.DP_REPLICATE in self.device_mesh.mesh_dim_names:
-            return self.device_mesh.get_local_rank(Strategies.DP_REPLICATE)
-        return 0
+        replicate_rank = self._mesh_rank(Strategies.DP_REPLICATE)
+        shard_rank = self._mesh_rank(Strategies.DP_SHARD)
+        return replicate_rank * self.dp_shard_size + shard_rank
 
     @property
     def data_world_size(self):
-        return self.dp_replicate_size
+        return self.dp_size
 
     def __repr__(self):
         return (
@@ -205,6 +205,7 @@ class ParallelConfig:
         self.device_mesh = device_mesh
         return self.device_mesh
     
+    @property
     def device(self):
         if self._device is not None:
             return self._device
@@ -234,7 +235,7 @@ class ParallelConfig:
         - DP ranks get different seeds (each sees different data)
         - TP ranks within same (DP/PP) group get same seed
         """
-        dp_rank = self._mesh_rank(Strategies.DP_REPLICATE)
+        dp_rank = self.data_rank
         pp_rank = self._mesh_rank(Strategies.PP)
 
         data_seed = seed + dp_rank

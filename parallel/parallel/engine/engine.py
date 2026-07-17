@@ -91,6 +91,7 @@ class ParallelEngine:
                 dist.broadcast(buffer, src=source_rank, group=group)
     
     def backward(self, loss):
+        self.fsdp_wrapper.prepare_backward(loss)
         if self.grad_scaler.is_enabled():
             self.grad_scaler.scale(loss).backward()
         else:
@@ -191,4 +192,3 @@ class ParallelEngine:
             dist.all_reduce(loss_log, op=dist.ReduceOp.SUM, group=dp_group)
             loss_log.div_(world_size)
         return loss_log
-

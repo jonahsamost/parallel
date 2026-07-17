@@ -9,7 +9,7 @@ from .eval import eval_bpb, get_token_bytes
 from .logging import get_logger
 from .state import ParallelConfig, RuntimeState, init_dist
 from .tracking import WandBTracker
-from .utils import dist_cleanup, load_cfg, model_init_rngs, model_train_rngs
+from .utils import dist_cleanup, load_cfg
 
 logger = get_logger(__name__)
 
@@ -66,7 +66,11 @@ def main():
         model = torch.compile(model)
         logger.info("Model compiled")
     model.train()
-    tokens_per_step = cfg.model.per_device_batch_size * pconfig.dp_replicate_size * cfg.model.max_seq_length
+    tokens_per_step = (
+        cfg.model.per_device_batch_size
+        * pconfig.data_world_size
+        * cfg.model.max_seq_length
+    )
     grad_accum_steps = cfg.config.grad_accum_steps
 
     pengine = ParallelEngine(
