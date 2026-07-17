@@ -9,6 +9,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from ..profiling import profile
+
 
 @dataclass
 class ParamMeta:
@@ -163,14 +165,15 @@ class DPParamUnit:
         if self.flat_shard is None:
             raise RuntimeError("Cannot all-gather before sharding")
 
-        shard_on_device = self.flat_shard.detach()
-        if self.cpu_offload:
-            shard_on_device = shard_on_device.to(self.device, non_blocking=True)
+        with profile("all-gather"):
+            shard_on_device = self.flat_shard.detach()
+            if self.cpu_offload:
+                shard_on_device = shard_on_device.to(self.device, non_blocking=True)
 
-        full_buf = torch.empty(
-            self.padded_numel, dtype=shard_on_device.dtype, device=self.device
-        )
-        dist.all_gather_into_tensor(full_buf, shard_on_device, group=self.group)
+            full_buf = torch.empty(
+                self.padded_numel, dtype=shard_on_device.dtype, device=self.device
+            )
+            dist.all_gather_into_tensor(full_buf, shard_on_device, group=self.group)
 
         for meta in self.param_metas:
             meta.parameter.data = full_buf[meta.offset : meta.offset + meta.numel].view(meta.shape)
