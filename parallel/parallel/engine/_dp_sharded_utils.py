@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 
 def group_named_parameters(
@@ -53,3 +54,7 @@ def discover_used_parameter_ids(
             if next_node is not None:
                 stack.append(next_node)
     return used_parameter_ids
+
+
+def local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor._local_tensor if isinstance(tensor, DTensor) else tensor

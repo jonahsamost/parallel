@@ -97,15 +97,18 @@ def _run_checkpoint_round_trip(rank, world_size, rendezvous_file, checkpoint_roo
 
         full_path = checkpoint_root / "full-model.pt"
         checkpoint.save_full_model(full_path)
-        for unit in wrapper.units:
-            unit.flat_shard.detach().zero_()
+        for parameter in wrapper.get_sharded_params():
+            parameter.to_local().detach().zero_()
         checkpoint.load_full_model(full_path)
         restored_full_state = checkpoint.full_state_dict()
         if rank == 0:
             for name, expected in expected_full_state.items():
                 torch.testing.assert_close(restored_full_state[name], expected)
 
-        saved_shards = [unit.flat_shard.detach().clone() for unit in wrapper.units]
+        saved_shards = [
+            parameter.to_local().detach().clone()
+            for parameter in wrapper.get_sharded_params()
+        ]
         saved_optimizer = optimizer.state_dict()
         saved_buffer = model.running_value.detach().clone()
         saved_rng = torch.get_rng_state()
@@ -127,8 +130,8 @@ def _run_checkpoint_round_trip(rank, world_size, rendezvous_file, checkpoint_roo
             metadata={"purpose": "round-trip"},
         )
 
-        for unit in wrapper.units:
-            unit.flat_shard.detach().fill_(rank + 100)
+        for parameter in wrapper.get_sharded_params():
+            parameter.to_local().detach().fill_(rank + 100)
         optimizer.state.clear()
         model.running_value.add_(10)
         torch.manual_seed(rank + 99)
@@ -144,7 +147,7 @@ def _run_checkpoint_round_trip(rank, world_size, rendezvous_file, checkpoint_roo
         }
         assert resume["metadata"] == {"purpose": "round-trip"}
         for actual, expected in zip(wrapper.get_sharded_params(), saved_shards):
-            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(actual.to_local(), expected)
         _assert_optimizer_states_equal(optimizer.state_dict(), saved_optimizer)
         torch.testing.assert_close(model.running_value, saved_buffer)
         torch.testing.assert_close(torch.rand(4), expected_random)

@@ -1,10 +1,13 @@
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from ..state import Strategies
 from ..utils import DTYPE_DICT
 from .checkpoint import CheckpointManager
 from .dp_sharded import FSDPWrapper
+from ._dp_sharded_utils import local_tensor
+
 
 
 class ParallelEngine:
@@ -62,7 +65,7 @@ class ParallelEngine:
             elif dim == Strategies.DP_REPLICATE:
                 tensors += self.fsdp_wrapper.get_sharded_params()
             for tensor in tensors:
-                value = tensor.detach()
+                value = local_tensor(tensor).detach()
                 if value.device.type == self.device.type:
                     dist.broadcast(value, src=source_rank, group=group)
                     continue
@@ -148,7 +151,7 @@ class ParallelEngine:
             dist.all_reduce(has_grad, op=dist.ReduceOp.MAX, group=dp_replicate_group)
             if param.grad is None:
                 param.grad = torch.zeros_like(param)
-            grad = param.grad
+            grad = local_tensor(param.grad)
             if grad.device.type == self.device.type:
                 dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=dp_replicate_group)
                 grad.div_(self.pconfig.dp_replicate_size)
@@ -163,7 +166,10 @@ class ParallelEngine:
     def _grads_are_finite(self) -> bool:
         finite = torch.ones((), dtype=torch.int32, device=self.device)
         for param in self.optimizer_params:
-            if param.grad is not None and not torch.isfinite(param.grad).all():
+            grad = param.grad
+            if isinstance(grad, DTensor):
+                grad = grad._local_tensor
+            if grad is not None and not torch.isfinite(grad).all():
                 finite.zero_()
                 break
 

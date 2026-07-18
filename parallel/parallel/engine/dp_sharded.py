@@ -7,6 +7,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 from ..state import ParallelConfig, Strategies
 from ._dp_param_unit import DPParamUnit
@@ -14,6 +15,7 @@ from ._dp_sharded_utils import (
     discover_used_parameter_ids,
     get_fsdp_units,
     group_named_parameters,
+    local_tensor,
 )
 
 
@@ -34,10 +36,14 @@ class FSDPWrapper:
         self.cpu_offload = cpu_offload
         self.activation_checkpoint = activation_checkpoint
         self.checkpoint_every_n = max(checkpoint_every_n, 1)
-        self.device = device
+        first_parameter = next(model.parameters(), None)
+        self.device = device or (
+            first_parameter.device if first_parameter is not None else torch.device("cpu")
+        )
 
         self.units: list[DPParamUnit] = []
         self.dp_shard_group: Optional[dist.ProcessGroup] = None
+        self.dp_shard_mesh = None
         self._backward_units: list[DPParamUnit] = []
         self._backward_positions: dict[int, int] = {}
         self._ready_backward_positions: set[int] = set()
@@ -45,6 +51,7 @@ class FSDPWrapper:
         self._inflight_backward_positions: list[int] = []
         self._max_inflight_gradient_reductions: int = 2
         self._backward_prepared: bool = False
+        self._defer_backward_collectives: bool = False
         self._state_dict_keys: tuple[str, ...] = ()
         self._parameter_state_names: dict[int, tuple[str, ...]] = {}
         self._parameter_state_keys: set[str] = set()
@@ -90,7 +97,8 @@ class FSDPWrapper:
         if self.units:
             raise RuntimeError("FSDPWrapper.shard_model() can only be called once")
 
-        self.dp_shard_group = self.pconfig.device_mesh.get_group(Strategies.DP_SHARD)
+        self.dp_shard_mesh = self.pconfig.device_mesh[Strategies.DP_SHARD]
+        self.dp_shard_group = self.dp_shard_mesh.get_group()
         if self.device is not None:
             for buffer in self.model.buffers():
                 buffer.data = buffer.data.to(self.device)
@@ -142,7 +150,7 @@ class FSDPWrapper:
         for i, (submodule, named_params, use_ckpt, reshard_after_forward) in enumerate(unit_specs):
             unit = DPParamUnit(
                 module=submodule,
-                dp_shard_group=self.dp_shard_group,
+                dp_shard_mesh=self.dp_shard_mesh,
                 unit_index=i,
                 cpu_offload=self.cpu_offload,
                 use_activation_checkpoint=use_ckpt,
@@ -169,7 +177,25 @@ class FSDPWrapper:
             unit.set_backward_ready_callback(self._on_unit_gradients_ready)
 
     def prepare_backward(self, loss: torch.Tensor):
-        """Discover this graph's used parameters and pre-mark empty units ready."""
+        """Prepare a collective-safe reduction schedule for this backward graph.
+
+        Autograd graphs may differ across shard ranks when model control flow is
+        rank-dependent (think MoE where some ranks may have no tokens routed
+        to their expert).
+        
+        One rank may consider a unit locally unused and become ready to reduce-scatter
+        its zero gradient, while another rank still needs to all-gather that unit's
+        parameters because they were resharded after forward. These different collectives
+        cannot be issued concurrently in different orders on the same process group.
+
+        We discover the locally used parameters from ``loss`` and sum a unit
+        usage bitmap across the shard group. A count of zero means globally
+        unused, ``world_size`` means universally used, and an intermediate
+        count means the ranks have divergent backward graphs. For divergence,
+        every rank gathers the union of used units in a fixed order before
+        autograd and defers reduce-scatters until backward has completed. When
+        all ranks agree, the normal overlapped backward schedule remains active.
+        """
         if not self.is_active:
             return
         if not isinstance(loss, torch.Tensor):
@@ -183,16 +209,55 @@ class FSDPWrapper:
             for parameter_id in unit.parameter_ids
         }
         used_parameter_ids = discover_used_parameter_ids(loss, parameter_ids)
+        local_used_units = torch.tensor(
+            [
+                int(bool(unit.parameter_ids.intersection(used_parameter_ids)))
+                for unit in self._backward_units
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        used_unit_counts = local_used_units.clone()
+        if self._backward_units:
+            dist.all_reduce(
+                used_unit_counts,
+                op=dist.ReduceOp.SUM,
+                group=self.dp_shard_group,
+            )
+        shard_world_size = dist.get_world_size(self.dp_shard_group)
+        globally_used_units = used_unit_counts > 0
+        divergent_units = (used_unit_counts > 0) & (
+            used_unit_counts < shard_world_size
+        )
+        # When any unit has divergent usage, the current conservative fallback does this:
+        #   Before backward, every rank all-gathers every globally used unit in the same order.
+        #   Backward runs without additional parameter all-gathers.
+        #   Used ranks accumulate real full gradients.
+        #   Unused ranks accumulate nothing.
+        #   After backward returns, all ranks issue reduce-scatters in one fixed order.
+        #   Locally missing gradients are represented by zero buffers.
+        self._defer_backward_collectives = bool(divergent_units.any().item())
+
         zero_ready_positions: set[int] = set()
         for position, unit in enumerate(self._backward_units):
             if unit.prepare_backward(used_parameter_ids):
                 zero_ready_positions.add(position)
+            unit.defer_backward_prefetch = self._defer_backward_collectives
 
         self._ready_backward_positions.update(zero_ready_positions)
+        if self._defer_backward_collectives:
+            for position, unit in enumerate(self._backward_units):
+                if globally_used_units[position].item():
+                    unit.all_gather()
         self._backward_prepared = True
 
     def _on_unit_gradients_ready(self, unit: DPParamUnit):
-        """Record local readiness and drain only the next globally ordered units."""
+        """
+        Record local readiness and drain only the next globally ordered units.
+        
+        Every gradient that local autograd is expected to produce for this unit now exists.
+        Does not mean that _every rank_ is ready. 
+        """
         if not self._backward_prepared:
             raise RuntimeError("FSDP unit became ready before prepare_backward()")
         try:
@@ -200,7 +265,8 @@ class FSDPWrapper:
         except KeyError as error:
             raise RuntimeError("Unknown FSDP unit reported gradient readiness") from error
         self._ready_backward_positions.add(position)
-        self._drain_backward_reductions()
+        if not self._defer_backward_collectives:
+            self._drain_backward_reductions()
 
     def _drain_backward_reductions(self):
         while self._next_backward_position in self._ready_backward_positions:
@@ -228,13 +294,20 @@ class FSDPWrapper:
         if not self.units:
             return [param for param in self.model.parameters() if param.requires_grad]
         return [
-            unit.flat_shard
+            meta.sharded_param
             for unit in self.units
-            if unit.requires_grad and unit.flat_shard is not None
+            if unit.requires_grad
+            for meta in unit.param_metas
+            if meta.sharded_param is not None
         ]
 
     def get_sharded_params(self) -> list[nn.Parameter]:
-        return [unit.flat_shard for unit in self.units if unit.flat_shard is not None]
+        return [
+            meta.sharded_param
+            for unit in self.units
+            for meta in unit.param_metas
+            if meta.sharded_param is not None
+        ]
 
     def finalize_backward(self):
         """Finish bounded in-flight reductions and commit optimizer gradients."""
@@ -243,10 +316,24 @@ class FSDPWrapper:
         if not self._backward_prepared:
             raise RuntimeError("FSDP backward was not prepared before finalization")
 
-        # This is needed when the entire local model was unused and no parameter
-        # hook fired to kick the precomputed zero-ready schedule.
-        self._drain_backward_reductions()
-        if self._next_backward_position != -1:
+        if not self._defer_backward_collectives:
+            # This is needed when the entire local model was unused and no
+            # parameter hook fired to kick the precomputed zero-ready schedule.
+            self._drain_backward_reductions()
+        missing_ready_positions = (
+            [
+                position
+                for position in range(len(self._backward_units))
+                if position not in self._ready_backward_positions
+            ]
+            if self._defer_backward_collectives
+            else (
+                []
+                if self._next_backward_position == -1
+                else [self._next_backward_position]
+            )
+        )
+        if missing_ready_positions:
             pending = [
                 {
                     "unit": unit.unit_index,
@@ -259,6 +346,8 @@ class FSDPWrapper:
                 "FSDP backward ended before every expected parameter gradient "
                 f"was accumulated: {pending}"
             )
+        if self._defer_backward_collectives:
+            self._drain_backward_reductions()
 
         if self._backward_units:
             for position in self._inflight_backward_positions:
@@ -276,13 +365,14 @@ class FSDPWrapper:
                     accumulate=bool(participated[position].item())
                 )
         for unit in self.units:
-            if not unit.requires_grad:
-                unit.free_full_params()
+            unit.free_full_params()
             unit.reset_backward_state()
+            unit.defer_backward_prefetch = False
 
         self._ready_backward_positions.clear()
         self._next_backward_position = len(self._backward_units) - 1
         self._backward_prepared = False
+        self._defer_backward_collectives = False
 
     def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
         """Clip using one norm shared by every rank in the shard group."""
@@ -293,18 +383,22 @@ class FSDPWrapper:
         local_sq_norm = torch.zeros((), dtype=torch.float32, device=self.device)
         for param in params:
             if param.grad is not None:
-                local_sq_norm += param.grad.detach().float().pow(2).sum().to(self.device)
+                grad = local_tensor(param.grad)
+                local_sq_norm += grad.detach().float().pow(2).sum().to(self.device)
         dist.all_reduce(local_sq_norm, op=dist.ReduceOp.SUM, group=self.dp_shard_group)
         total_norm = local_sq_norm.sqrt()
         clip_coefficient = max_norm / (total_norm + 1e-6)
         if clip_coefficient < 1:
             for param in params:
                 if param.grad is not None:
-                    param.grad.mul_(clip_coefficient.to(param.grad.device))
+                    grad = local_tensor(param.grad)
+                    grad.mul_(clip_coefficient.to(grad.device))
         return total_norm
 
     @staticmethod
     def _cpu_copy(value: Any) -> Any:
+        if isinstance(value, DTensor):
+            return value._local_tensor.detach().to(device="cpu", copy=True)
         if isinstance(value, torch.Tensor):
             return value.detach().to(device="cpu", copy=True)
         return copy.deepcopy(value)
@@ -359,7 +453,7 @@ class FSDPWrapper:
 
     def _sync_tensor(self, tensor: torch.Tensor, group) -> None:
         source_rank = dist.get_global_rank(group, 0)
-        value = tensor.detach()
+        value = local_tensor(tensor).detach()
         if value.device.type == self.device.type:
             dist.broadcast(value, src=source_rank, group=group)
             return
@@ -506,12 +600,13 @@ class FSDPWrapper:
                             for name in self._state_dict_keys:
                                 if name in metas_by_name and name in state_dict:
                                     metas_by_name[name].parameter.detach().copy_(state_dict[name])
-                        dist.broadcast(
-                            unit._full_params_buf,
-                            src=group_root,
-                            group=self.dp_shard_group,
-                        )
-                        unit.writeback_shard()
+                        for buffer in unit._full_params_buf:
+                            dist.broadcast(
+                                buffer,
+                                src=group_root,
+                                group=self.dp_shard_group,
+                            )
+                        unit.writeback_shards()
                     finally:
                         unit.free_full_params()
                 if is_group_root:
@@ -530,15 +625,17 @@ class FSDPWrapper:
             "units": [
                 {
                     "unit_index": unit.unit_index,
-                    "flat_numel": unit.flat_numel,
-                    "padded_numel": unit.padded_numel,
-                    "chunk_size": unit.chunk_size,
                     "parameters": [
                         {
                             "names": list(self._parameter_state_names[id(meta.parameter)]),
                             "shape": list(meta.shape),
+                            "stride": list(meta.stride),
                             "numel": meta.numel,
-                            "offset": meta.offset,
+                            "local_shape": list(meta.sharded_param._local_tensor.shape),
+                            "placements": [
+                                str(placement)
+                                for placement in meta.sharded_param.placements
+                            ],
                             "dtype": str(meta.parameter.dtype),
                             "requires_grad": meta.parameter.requires_grad,
                         }
@@ -560,7 +657,7 @@ class FSDPWrapper:
             }
         return {
             "layout": self.checkpoint_layout(),
-            "shards": [self._cpu_copy(unit.flat_shard) for unit in self.units],
+            "shards": [self._cpu_copy(param) for param in self.get_sharded_params()],
             "non_parameter_state": self._non_parameter_state_dict(),
         }
 
@@ -576,19 +673,21 @@ class FSDPWrapper:
             return self.model.load_state_dict(state_dict["full_state"], strict=strict)
 
         shards = state_dict.get("shards", [])
-        if len(shards) != len(self.units):
+        sharded_params = self.get_sharded_params()
+        if len(shards) != len(sharded_params):
             raise RuntimeError(
-                f"Expected {len(self.units)} model shards, found {len(shards)}"
+                f"Expected {len(sharded_params)} parameter shards, found {len(shards)}"
             )
-        for unit, shard in zip(self.units, shards):
+        for index, (parameter, shard) in enumerate(zip(sharded_params, shards)):
             if not isinstance(shard, torch.Tensor):
                 raise RuntimeError(
-                    f"Invalid shard for unit {unit.unit_index}: expected a tensor"
+                    f"Invalid parameter shard {index}: expected a tensor"
                 )
-            if shard.shape != unit.flat_shard.shape or shard.dtype != unit.flat_shard.dtype:
+            local = parameter._local_tensor
+            if shard.shape != local.shape or shard.dtype != local.dtype:
                 raise RuntimeError(
-                    f"Invalid shard for unit {unit.unit_index}: expected shape/dtype "
-                    f"{tuple(unit.flat_shard.shape)}/{unit.flat_shard.dtype}, got "
+                    f"Invalid parameter shard {index}: expected shape/dtype "
+                    f"{tuple(local.shape)}/{local.dtype}, got "
                     f"{tuple(shard.shape)}/{shard.dtype}"
                 )
 
@@ -626,8 +725,8 @@ class FSDPWrapper:
         if errors:
             raise RuntimeError("; ".join(errors))
 
-        for unit, shard in zip(self.units, shards):
-            unit.flat_shard.detach().copy_(shard)
+        for parameter, shard in zip(sharded_params, shards):
+            parameter._local_tensor.detach().copy_(shard)
         self._copy_non_parameter_state(non_parameter_state)
         return nn.modules.module._IncompatibleKeys(missing, unexpected)
 

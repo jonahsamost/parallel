@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
 
 from parallel.parallel.engine.dp_sharded import FSDPWrapper
 from parallel.parallel.engine.engine import ParallelEngine
@@ -59,6 +60,20 @@ class SparseUnitModel(nn.Module):
         return self.experts[expert](inputs).square().mean()
 
 
+@contextmanager
+def _single_rank_mesh(rendezvous_file):
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_file}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield init_device_mesh("cpu", (1,), mesh_dim_names=("dp_shard",))
+    finally:
+        dist.destroy_process_group()
+
+
 def _run_fsdp_parity(rank, world_size, rendezvous_file):
     dist.init_process_group(
         backend="gloo",
@@ -84,12 +99,16 @@ def _run_fsdp_parity(rank, world_size, rendezvous_file):
         optimizer_params = wrapper.get_optimizer_params()
         optimizer_param_ids = {id(parameter) for parameter in optimizer_params}
         assert optimizer_params
-        assert all(parameter.requires_grad for parameter in optimizer_params)
-        assert all(parameter.numel() == 0 for parameter in model.parameters())
+        assert all(isinstance(parameter, DTensor) for parameter in model.parameters())
+        assert all(parameter.placements == (Shard(0),) for parameter in model.parameters())
+        assert optimizer_param_ids == {
+            id(parameter) for parameter in model.parameters() if parameter.requires_grad
+        }
         assert all(
-            id(unit.flat_shard) not in optimizer_param_ids
+            id(meta.sharded_param) not in optimizer_param_ids
             for unit in wrapper.units
             if not unit.requires_grad
+            for meta in unit.param_metas
         )
 
         optimizer = torch.optim.SGD(optimizer_params, lr=0.05)
@@ -194,7 +213,9 @@ def _run_fsdp_rank_local_unused(rank, world_size, rendezvous_file):
 
         # A unit unused on every rank must retain grad=None so weight decay does
         # not update it merely because we issued a zero-filled reduce-scatter.
-        assert wrapper.units[2].flat_shard.grad is None
+        assert all(
+            meta.sharded_param.grad is None for meta in wrapper.units[2].param_metas
+        )
 
         for data_rank in range(world_size):
             reference_inputs = (
@@ -282,6 +303,7 @@ def test_backward_reducer_drains_ready_units_in_reverse_order():
     wrapper._next_backward_position = -1
     wrapper._inflight_backward_positions = []
     wrapper._max_inflight_gradient_reductions = 2
+    wrapper._defer_backward_collectives = False
     wrapper.dp_shard_group = Mock()
     wrapper._initialize_backward_reducer()
     wrapper._backward_prepared = True
@@ -315,26 +337,8 @@ def test_backward_reducer_drains_ready_units_in_reverse_order():
         unit.reset_backward_state.assert_called_once_with()
 
 
-def test_backward_hooks_launch_reduction_before_finalize_without_network():
-    group = object()
-    mesh = SimpleNamespace(get_group=Mock(return_value=group))
-
-    def all_gather_into_tensor(output, input_, **kwargs):
-        output.copy_(input_)
-
-    def reduce_scatter_tensor(output, input_, **kwargs):
-        output.copy_(input_)
-        return Mock(wait=Mock())
-
-    with (
-        patch.object(dist, "get_world_size", return_value=1),
-        patch.object(dist, "get_rank", return_value=0),
-        patch.object(dist, "get_global_rank", return_value=0),
-        patch.object(dist, "broadcast"),
-        patch.object(dist, "all_gather_into_tensor", side_effect=all_gather_into_tensor),
-        patch.object(dist, "reduce_scatter_tensor", side_effect=reduce_scatter_tensor),
-        patch.object(dist, "all_reduce"),
-    ):
+def test_backward_hooks_launch_reduction_before_finalize(tmp_path):
+    with _single_rank_mesh(tmp_path / "hook-rendezvous") as mesh:
         torch.manual_seed(2468)
         reference = RankConditionalModel()
         model = RankConditionalModel()
@@ -361,14 +365,18 @@ def test_backward_hooks_launch_reduction_before_finalize_without_network():
         )
 
         wrapper.finalize_backward()
-        assert wrapper.units[2].flat_shard.grad is None
+        assert all(
+            meta.sharded_param.grad is None for meta in wrapper.units[2].param_metas
+        )
 
         second_inputs = inputs.add(1)
         second_loss = model(second_inputs, 0).div(2)
         wrapper.prepare_backward(second_loss)
         second_loss.backward()
         wrapper.finalize_backward()
-        assert wrapper.units[2].flat_shard.grad is None
+        assert all(
+            meta.sharded_param.grad is None for meta in wrapper.units[2].param_metas
+        )
 
         optimizer = torch.optim.SGD(wrapper.get_optimizer_params(), lr=0.1, weight_decay=0.1)
         reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1, weight_decay=0.1)
@@ -382,26 +390,8 @@ def test_backward_hooks_launch_reduction_before_finalize_without_network():
             torch.testing.assert_close(actual_state[name], expected)
 
 
-def test_partially_used_unit_reduces_after_expected_subset_accumulates():
-    group = object()
-    mesh = SimpleNamespace(get_group=Mock(return_value=group))
-
-    def all_gather_into_tensor(output, input_, **kwargs):
-        output.copy_(input_)
-
-    def reduce_scatter_tensor(output, input_, **kwargs):
-        output.copy_(input_)
-        return Mock(wait=Mock())
-
-    with (
-        patch.object(dist, "get_world_size", return_value=1),
-        patch.object(dist, "get_rank", return_value=0),
-        patch.object(dist, "get_global_rank", return_value=0),
-        patch.object(dist, "broadcast"),
-        patch.object(dist, "all_gather_into_tensor", side_effect=all_gather_into_tensor),
-        patch.object(dist, "reduce_scatter_tensor", side_effect=reduce_scatter_tensor),
-        patch.object(dist, "all_reduce"),
-    ):
+def test_partially_used_unit_reduces_after_expected_subset_accumulates(tmp_path):
+    with _single_rank_mesh(tmp_path / "partial-rendezvous") as mesh:
         torch.manual_seed(9753)
         reference = SparseUnitModel()
         model = SparseUnitModel()
