@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -45,9 +45,46 @@ class FSDPWrapper:
         self._inflight_backward_positions: list[int] = []
         self._max_inflight_gradient_reductions: int = 2
         self._backward_prepared: bool = False
+        self._state_dict_keys: tuple[str, ...] = ()
+        self._parameter_state_names: dict[int, tuple[str, ...]] = {}
+        self._parameter_state_keys: set[str] = set()
+
+    def _capture_state_dict_layout(self) -> None:
+        """Capture canonical model keys before parameters become placeholders."""
+        state = self.model.state_dict(keep_vars=True)
+        parameter_ids = {id(parameter) for parameter in self.model.parameters()}
+        names_by_parameter: dict[int, list[str]] = {
+            parameter_id: [] for parameter_id in parameter_ids
+        }
+        for name, value in state.items():
+            if id(value) in names_by_parameter:
+                names_by_parameter[id(value)].append(name)
+
+        missing = [
+            name
+            for name, parameter in self.model.named_parameters()
+            if not names_by_parameter[id(parameter)]
+        ]
+        if missing:
+            raise RuntimeError(
+                "Every model parameter must be represented in model.state_dict(); "
+                f"missing parameters: {missing}"
+            )
+
+        self._state_dict_keys = tuple(state.keys())
+        self._parameter_state_names = {
+            parameter_id: tuple(names)
+            for parameter_id, names in names_by_parameter.items()
+        }
+        self._parameter_state_keys = {
+            name
+            for names in self._parameter_state_names.values()
+            for name in names
+        }
 
     def shard_model(self):
         """Walk the model, create DPParamUnits, shard params, wire prefetch."""
+        self._capture_state_dict_layout()
         if self.pconfig.dp_shard_size <= 1 or self.pconfig.device_mesh is None:
             return
         if self.units:
@@ -62,7 +99,10 @@ class FSDPWrapper:
         owned_param_ids: set[int] = set()
 
         for i, submodule in enumerate(submodules):
-            named_params = list(submodule.named_parameters())
+            named_params = [
+                (self._parameter_state_names[id(parameter)][0], parameter)
+                for _, parameter in submodule.named_parameters()
+            ]
             duplicate_ids = owned_param_ids.intersection(id(param) for _, param in named_params)
             if duplicate_ids:
                 raise ValueError("A parameter is shared by multiple FSDP units")
@@ -83,8 +123,8 @@ class FSDPWrapper:
 
         if submodules != [self.model]:
             root_params = [
-                (name, param)
-                for name, param in self.model.named_parameters()
+                (self._parameter_state_names[id(param)][0], param)
+                for _, param in self.model.named_parameters()
                 if id(param) not in owned_param_ids
             ]
             if root_params:
@@ -263,43 +303,341 @@ class FSDPWrapper:
                     param.grad.mul_(clip_coefficient.to(param.grad.device))
         return total_norm
 
-    # TODO dont gather entire model onto one device
-    def state_dict(self) -> OrderedDict:
-        """Return a full, detached state dict on every shard rank."""
+    @staticmethod
+    def _cpu_copy(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu", copy=True)
+        return copy.deepcopy(value)
+
+    def _replicate_rank(self) -> int:
+        mesh = self.pconfig.device_mesh
+        if (
+            mesh is not None
+            and Strategies.DP_REPLICATE in getattr(mesh, "mesh_dim_names", ())
+        ):
+            return mesh.get_local_rank(Strategies.DP_REPLICATE)
+        return 0
+
+    def _is_checkpoint_replica(self) -> bool:
+        return self._replicate_rank() == 0
+
+    def _full_state_root(self) -> bool:
+        if not self._is_checkpoint_replica():
+            return False
+        if self.is_active:
+            return dist.get_rank(self.dp_shard_group) == 0
+        return not dist.is_initialized() or dist.get_rank() == 0
+
+    def _non_parameter_state_dict(self) -> OrderedDict:
+        current_state = self.model.state_dict(keep_vars=True)
+        state = OrderedDict(
+            (name, self._cpu_copy(value))
+            for name, value in current_state.items()
+            if name not in self._parameter_state_keys
+        )
+        if hasattr(current_state, "_metadata"):
+            state._metadata = copy.deepcopy(current_state._metadata)
+        return state
+
+    def _copy_non_parameter_state(self, state_dict) -> None:
+        current_state = self.model.state_dict(keep_vars=True)
+        for name, destination in current_state.items():
+            if name in self._parameter_state_keys or name not in state_dict:
+                continue
+            source = state_dict[name]
+            if isinstance(destination, torch.Tensor):
+                destination.detach().copy_(source)
+                continue
+            suffix = "._extra_state"
+            if name == "_extra_state":
+                module = self.model
+            elif name.endswith(suffix):
+                module = self.model.get_submodule(name[: -len(suffix)])
+            else:
+                continue
+            module.set_extra_state(copy.deepcopy(source))
+
+    def _sync_tensor(self, tensor: torch.Tensor, group) -> None:
+        source_rank = dist.get_global_rank(group, 0)
+        value = tensor.detach()
+        if value.device.type == self.device.type:
+            dist.broadcast(value, src=source_rank, group=group)
+            return
+        staged = value.to(self.device)
+        dist.broadcast(staged, src=source_rank, group=group)
+        value.copy_(staged.to(value.device))
+
+    def _sync_replicated_state(self) -> None:
+        mesh = self.pconfig.device_mesh
+        if (
+            mesh is None
+            or Strategies.DP_REPLICATE not in getattr(mesh, "mesh_dim_names", ())
+        ):
+            return
+        group = mesh.get_group(Strategies.DP_REPLICATE)
+        tensors = list(self.model.buffers())
+        if self.is_active:
+            tensors.extend(self.get_sharded_params())
+        else:
+            tensors.extend(self.model.parameters())
+        for tensor in tensors:
+            self._sync_tensor(tensor, group)
+
+    def full_state_dict(self) -> Optional[OrderedDict]:
+        """Build a full CPU state dict on global rank zero, one unit at a time."""
+        if not self._state_dict_keys:
+            self._capture_state_dict_layout()
+        if not self._is_checkpoint_replica():
+            return None
         if not self.is_active:
-            return self.model.state_dict()
-        for unit in self.units:
-            unit.all_gather()
-        try:
-            model_state = self.model.state_dict()
+            if not self._full_state_root():
+                return None
+            model_state = self.model.state_dict(keep_vars=True)
             state = OrderedDict(
-                (
-                    name,
-                    value.detach().clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value),
-                )
-                for name, value in model_state.items()
+                (name, self._cpu_copy(value)) for name, value in model_state.items()
             )
             if hasattr(model_state, "_metadata"):
                 state._metadata = copy.deepcopy(model_state._metadata)
             return state
-        finally:
-            for unit in self.units:
-                unit.free_full_params()
 
-    def load_state_dict(self, state_dict, strict: bool = True):
-        """Load a full state dict and write each rank's optimizer shards."""
-        if not self.is_active:
-            return self.model.load_state_dict(state_dict, strict=strict)
+        root = self._full_state_root()
+        parameter_values: dict[str, torch.Tensor] = {}
         for unit in self.units:
             unit.all_gather()
-        try:
-            result = self.model.load_state_dict(state_dict, strict=strict)
-            for unit in self.units:
-                unit.writeback_shard()
-            return result
-        finally:
-            for unit in self.units:
+            try:
+                if root:
+                    for meta in unit.param_metas:
+                        cpu_value = self._cpu_copy(meta.parameter)
+                        for name in self._parameter_state_names[id(meta.parameter)]:
+                            parameter_values[name] = cpu_value
+            finally:
                 unit.free_full_params()
+
+        if not root:
+            return None
+        non_parameter_state = self._non_parameter_state_dict()
+        state = OrderedDict()
+        for name in self._state_dict_keys:
+            if name in parameter_values:
+                state[name] = parameter_values[name]
+            else:
+                state[name] = non_parameter_state[name]
+        if hasattr(non_parameter_state, "_metadata"):
+            state._metadata = copy.deepcopy(non_parameter_state._metadata)
+        return state
+
+    def _validate_full_state_dict(self, state_dict, strict: bool) -> dict[str, Any]:
+        expected = set(self._state_dict_keys)
+        actual = set(state_dict.keys())
+        missing = [name for name in self._state_dict_keys if name not in actual]
+        unexpected = [name for name in state_dict if name not in expected]
+
+        expected_shapes: dict[str, torch.Size] = {}
+        for unit in self.units:
+            for meta in unit.param_metas:
+                for name in self._parameter_state_names[id(meta.parameter)]:
+                    expected_shapes[name] = meta.shape
+        current_state = self.model.state_dict(keep_vars=True)
+        for name, value in current_state.items():
+            if isinstance(value, torch.Tensor) and name not in expected_shapes:
+                expected_shapes[name] = value.shape
+
+        errors = []
+        if strict and missing:
+            errors.append(f"Missing key(s): {missing}")
+        if strict and unexpected:
+            errors.append(f"Unexpected key(s): {unexpected}")
+        for name in expected.intersection(actual):
+            value = state_dict[name]
+            if name in expected_shapes:
+                if not isinstance(value, torch.Tensor):
+                    errors.append(f"Expected tensor for {name}, got {type(value).__name__}")
+                elif value.shape != expected_shapes[name]:
+                    errors.append(
+                        f"Shape mismatch for {name}: expected {tuple(expected_shapes[name])}, "
+                        f"got {tuple(value.shape)}"
+                    )
+        return {
+            "error": "; ".join(errors) if errors else None,
+            "missing": missing,
+            "unexpected": unexpected,
+        }
+
+    def load_full_state_dict(self, state_dict, strict: bool = True):
+        """Load a rank-zero full state dict without materializing the whole model."""
+        if not self._state_dict_keys:
+            self._capture_state_dict_layout()
+
+        root = not dist.is_initialized() or dist.get_rank() == 0
+        if root:
+            if state_dict is None:
+                validation = {
+                    "error": "Global rank zero requires a full state dict",
+                    "missing": [],
+                    "unexpected": [],
+                }
+            else:
+                validation = self._validate_full_state_dict(state_dict, strict)
+        else:
+            validation = None
+        if dist.is_initialized():
+            payload = [validation]
+            dist.broadcast_object_list(payload, src=0)
+            validation = payload[0]
+        if validation["error"] is not None:
+            raise RuntimeError(f"Error(s) in loading state_dict: {validation['error']}")
+
+        if self._is_checkpoint_replica():
+            if not self.is_active:
+                if self._full_state_root():
+                    self.model.load_state_dict(state_dict, strict=strict)
+            else:
+                group_root = dist.get_global_rank(self.dp_shard_group, 0)
+                is_group_root = self._full_state_root()
+                for unit in self.units:
+                    unit.all_gather()
+                    try:
+                        if is_group_root:
+                            metas_by_name = {
+                                name: meta
+                                for meta in unit.param_metas
+                                for name in self._parameter_state_names[id(meta.parameter)]
+                            }
+                            for name in self._state_dict_keys:
+                                if name in metas_by_name and name in state_dict:
+                                    metas_by_name[name].parameter.detach().copy_(state_dict[name])
+                        dist.broadcast(
+                            unit._full_params_buf,
+                            src=group_root,
+                            group=self.dp_shard_group,
+                        )
+                        unit.writeback_shard()
+                    finally:
+                        unit.free_full_params()
+                if is_group_root:
+                    self._copy_non_parameter_state(state_dict)
+                for buffer in self.model.buffers():
+                    self._sync_tensor(buffer, self.dp_shard_group)
+
+        self._sync_replicated_state()
+        return nn.modules.module._IncompatibleKeys(
+            validation["missing"], validation["unexpected"]
+        )
+
+    def checkpoint_layout(self) -> dict[str, Any]:
+        return {
+            "state_dict_keys": list(self._state_dict_keys),
+            "units": [
+                {
+                    "unit_index": unit.unit_index,
+                    "flat_numel": unit.flat_numel,
+                    "padded_numel": unit.padded_numel,
+                    "chunk_size": unit.chunk_size,
+                    "parameters": [
+                        {
+                            "names": list(self._parameter_state_names[id(meta.parameter)]),
+                            "shape": list(meta.shape),
+                            "numel": meta.numel,
+                            "offset": meta.offset,
+                            "dtype": str(meta.parameter.dtype),
+                            "requires_grad": meta.parameter.requires_grad,
+                        }
+                        for meta in unit.param_metas
+                    ],
+                }
+                for unit in self.units
+            ],
+        }
+
+    def sharded_state_dict(self) -> dict[str, Any]:
+        """Return this rank's CPU model shards and replicated non-parameter state."""
+        if not self._state_dict_keys:
+            self._capture_state_dict_layout()
+        if not self.is_active:
+            return {
+                "layout": self.checkpoint_layout(),
+                "full_state": self.full_state_dict(),
+            }
+        return {
+            "layout": self.checkpoint_layout(),
+            "shards": [self._cpu_copy(unit.flat_shard) for unit in self.units],
+            "non_parameter_state": self._non_parameter_state_dict(),
+        }
+
+    def load_sharded_state_dict(self, state_dict, strict: bool = True):
+        """Load same-topology local shards directly, without any collectives."""
+        if not self._state_dict_keys:
+            self._capture_state_dict_layout()
+        if not isinstance(state_dict, dict):
+            raise TypeError("Sharded checkpoint state must be a dictionary")
+        if state_dict.get("layout") != self.checkpoint_layout():
+            raise RuntimeError("Sharded checkpoint layout does not match the current model")
+        if not self.is_active:
+            return self.model.load_state_dict(state_dict["full_state"], strict=strict)
+
+        shards = state_dict.get("shards", [])
+        if len(shards) != len(self.units):
+            raise RuntimeError(
+                f"Expected {len(self.units)} model shards, found {len(shards)}"
+            )
+        for unit, shard in zip(self.units, shards):
+            if not isinstance(shard, torch.Tensor):
+                raise RuntimeError(
+                    f"Invalid shard for unit {unit.unit_index}: expected a tensor"
+                )
+            if shard.shape != unit.flat_shard.shape or shard.dtype != unit.flat_shard.dtype:
+                raise RuntimeError(
+                    f"Invalid shard for unit {unit.unit_index}: expected shape/dtype "
+                    f"{tuple(unit.flat_shard.shape)}/{unit.flat_shard.dtype}, got "
+                    f"{tuple(shard.shape)}/{shard.dtype}"
+                )
+
+        non_parameter_state = state_dict.get("non_parameter_state", {})
+        if not isinstance(non_parameter_state, dict):
+            raise TypeError("Checkpoint non-parameter state must be a dictionary")
+        current_state = self.model.state_dict(keep_vars=True)
+        expected_names = [
+            name for name in current_state if name not in self._parameter_state_keys
+        ]
+        actual_names = list(non_parameter_state)
+        missing = [name for name in expected_names if name not in non_parameter_state]
+        expected_name_set = set(expected_names)
+        unexpected = [name for name in actual_names if name not in expected_name_set]
+        errors = []
+        if strict and missing:
+            errors.append(f"Missing non-parameter key(s): {missing}")
+        if strict and unexpected:
+            errors.append(f"Unexpected non-parameter key(s): {unexpected}")
+        for name in set(expected_names).intersection(non_parameter_state):
+            destination = current_state[name]
+            source = non_parameter_state[name]
+            if isinstance(destination, torch.Tensor):
+                if not isinstance(source, torch.Tensor):
+                    errors.append(
+                        f"Expected tensor for non-parameter state {name}, got "
+                        f"{type(source).__name__}"
+                    )
+                elif source.shape != destination.shape or source.dtype != destination.dtype:
+                    errors.append(
+                        f"Invalid non-parameter state for {name}: expected shape/dtype "
+                        f"{tuple(destination.shape)}/{destination.dtype}, got "
+                        f"{tuple(source.shape)}/{source.dtype}"
+                    )
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+        for unit, shard in zip(self.units, shards):
+            unit.flat_shard.detach().copy_(shard)
+        self._copy_non_parameter_state(non_parameter_state)
+        return nn.modules.module._IncompatibleKeys(missing, unexpected)
+
+    def state_dict(self) -> Optional[OrderedDict]:
+        """Compatibility alias for the memory-safe rank-zero CPU state dict."""
+        return self.full_state_dict()
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Compatibility alias for loading a rank-zero full state dict."""
+        return self.load_full_state_dict(state_dict, strict=strict)
 
     @property
     def is_active(self) -> bool:

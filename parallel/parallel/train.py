@@ -1,4 +1,5 @@
 from omegaconf import OmegaConf
+from pathlib import Path
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -38,6 +39,29 @@ def main():
 
     pconfig.model_train_rngs(seed=cfg.get("seed", 42))
 
+    if cfg.engine.compile and pconfig.dp_shard_size > 1:
+        raise NotImplementedError(
+            "torch.compile is not yet supported with the custom FSDP implementation"
+        )
+    if pconfig.dp_shard_size <= 1:
+        model.to(device)
+    model.train()
+
+    pengine = ParallelEngine(
+        model, tokenizer, pconfig, cfg, device
+    )
+    if cfg.engine.compile:
+        logger.info("Model loaded. Compiling...")
+        model = torch.compile(model)
+        # Checkpointing keeps the original module while training uses its
+        # compiled wrapper; both reference the same parameters and buffers.
+        pengine.model = model
+        logger.info("Model compiled")
+    resume = None
+    if cfg.config.resume_from:
+        logger.info(f"Loading checkpoint from {cfg.config.resume_from}")
+        resume = pengine.load_checkpoint(cfg.config.resume_from)
+
     train_dataloader = dist_data_loader(
         tokenizer,
         cfg.model.per_device_batch_size,
@@ -45,6 +69,7 @@ def main():
         split="train",
         device=device,
         pconfig=pconfig,
+        resume_state_dict=(resume or {}).get("dataloader_state"),
     )
     eval_dataloader = dist_data_loader(
         tokenizer,
@@ -53,19 +78,11 @@ def main():
         split="val",
         device=device,
         pconfig=pconfig,
+        resume_state_dict=(resume or {}).get("eval_dataloader_state"),
     )
 
     ### train
 
-    if pconfig.dp_shard_size <= 1:
-        model.to(device)
-    if cfg.engine.compile:
-        if pconfig.dp_shard_size > 1:
-            raise NotImplementedError("torch.compile is not yet supported with the custom FSDP implementation")
-        logger.info("Model loaded. Compiling...")
-        model = torch.compile(model)
-        logger.info("Model compiled")
-    model.train()
     tokens_per_step = (
         cfg.model.per_device_batch_size
         * pconfig.data_world_size
@@ -73,15 +90,14 @@ def main():
     )
     grad_accum_steps = cfg.config.grad_accum_steps
 
-    pengine = ParallelEngine(
-        model, tokenizer, pconfig, cfg, device
-    )
-
-    for step in range(1, cfg.config.max_steps + 1):
+    start_step = (resume or {}).get("step", 0) + 1
+    eval_dataloader_state = (resume or {}).get("eval_dataloader_state")
+    for step in range(start_step, cfg.config.max_steps + 1):
         step_start = time.time()
         total_loss = torch.tensor(0.0, device=device)
+        dataloader_state = None
         for _ in range(grad_accum_steps):
-            x, y, _ = next(train_dataloader)
+            x, y, dataloader_state = next(train_dataloader)
             loss = pengine.forward(x, y).loss / grad_accum_steps
             pengine.backward(loss)
             total_loss += loss.detach() 
@@ -109,11 +125,24 @@ def main():
         if step % cfg.config.eval_interval == 0 or step == cfg.config.max_steps:
             logger.info("Evaling...")
             pengine.sync_buffers()
-            bpb = eval_bpb(
+            bpb, eval_dataloader_state = eval_bpb(
                 model, eval_dataloader, cfg.config.eval_steps,
                 device, pconfig, pengine.use_amp, pengine.amp_dtype, token_bytes
             )
             wandb.log({"eval/loss": bpb, "step": step}, step=step)
+
+        checkpoint_interval = cfg.config.checkpoint_interval
+        if checkpoint_interval > 0 and step % checkpoint_interval == 0:
+            checkpoint_path = (
+                Path(cfg.config.checkpoint_dir) / f"step-{step:08d}"
+            )
+            logger.info(f"Saving checkpoint to {checkpoint_path}")
+            pengine.save_checkpoint(
+                checkpoint_path,
+                step=step,
+                dataloader_state=dataloader_state,
+                eval_dataloader_state=eval_dataloader_state,
+            )
     
     wandb.finish()
     dist_cleanup()

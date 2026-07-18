@@ -74,7 +74,6 @@ class DPParamUnit:
         self._full_params_buf: Optional[torch.Tensor] = None
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
         self._post_accumulate_handles: list[torch.utils.hooks.RemovableHook] = []
-        self._expected_grad_param_ids: Optional[set[int]] = None
         self._post_accumulated_param_ids: set[int] = set()
         self._backward_ready_callback: Optional[Callable[[DPParamUnit], None]] = None
         self._backward_ready_notified: bool = False
@@ -216,12 +215,10 @@ class DPParamUnit:
             raise RuntimeError(
                 f"Gradient reduction already started for FSDP unit {self.unit_index}"
             )
-        if self._expected_grad_param_ids is None:
-            raise RuntimeError(
-                f"FSDP unit {self.unit_index} was not prepared for backward"
-            )
 
-        local_participated = bool(self._expected_grad_param_ids)
+        local_participated = any(
+            meta.parameter.grad is not None for meta in self.param_metas
+        )
         grad_buf = torch.zeros(
             self.padded_numel, dtype=self.flat_shard.dtype, device=self.device
         )
@@ -298,7 +295,6 @@ class DPParamUnit:
             raise RuntimeError(
                 f"Cannot reset FSDP unit {self.unit_index} with an in-flight reduction"
             )
-        self._expected_grad_param_ids = None
         self._post_accumulated_param_ids.clear()
         self._backward_ready_notified = False
         self._gradient_reduction_started = False
@@ -316,45 +312,6 @@ class DPParamUnit:
         self, callback: Callable[[DPParamUnit], None]
     ) -> None:
         self._backward_ready_callback = callback
-
-    def prepare_backward(self, used_param_ids: set[int]) -> bool:
-        """Record which local parameters autograd will visit in this backward."""
-        if self._expected_grad_param_ids is not None:
-            raise RuntimeError(
-                f"FSDP unit {self.unit_index} is already prepared for backward"
-            )
-        if self._gradient_reduction_started:
-            raise RuntimeError(
-                f"FSDP unit {self.unit_index} still has reduction state from backward"
-            )
-        self._expected_grad_param_ids = {
-            id(parameter)
-            for parameter in self._params
-            if id(parameter) in used_param_ids
-        }
-        if not self._expected_grad_param_ids:
-            self.free_full_params()
-            self._backward_ready_notified = True
-            return True
-        return False
-
-    @property
-    def backward_ready(self) -> bool:
-        return self._backward_ready_notified
-
-    @property
-    def parameter_ids(self) -> set[int]:
-        return {id(parameter) for parameter in self._params}
-
-    def missing_expected_grad_names(self) -> list[str]:
-        if self._expected_grad_param_ids is None:
-            return [name for name, _ in self._named_params]
-        return [
-            name
-            for name, parameter in self._named_params
-            if id(parameter) in self._expected_grad_param_ids
-            and id(parameter) not in self._post_accumulated_param_ids
-        ]
 
     # Prefetching
 
@@ -432,13 +389,9 @@ class DPParamUnit:
         self._is_in_backward = False
 
     def _post_accumulate_grad_hook(self, parameter):
-        if self._expected_grad_param_ids is None:
-            raise RuntimeError(
-                "FSDP backward started without calling prepare_backward(loss)"
-            )
         self._post_accumulated_param_ids.add(id(parameter))
         if (
-            self._expected_grad_param_ids <= self._post_accumulated_param_ids
+            len(self._post_accumulated_param_ids) == len(self._params)
             and not self._backward_ready_notified
         ):
             self._backward_ready_notified = True

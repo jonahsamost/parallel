@@ -3,6 +3,7 @@ import torch.distributed as dist
 
 from ..state import Strategies
 from ..utils import DTYPE_DICT
+from .checkpoint import CheckpointManager
 from .dp_sharded import FSDPWrapper
 
 
@@ -44,6 +45,7 @@ class ParallelEngine:
             weight_decay=cfg.optim.weight_decay,
         )
         self.optimizer.zero_grad(set_to_none=True)
+        self.checkpoint = CheckpointManager(self)
 
     def _sync_initial_state(self):
         """ Ensure each dp replica starts from identical model state """
@@ -173,10 +175,42 @@ class ParallelEngine:
         return bool(finite.item())
 
     def state_dict(self):
-        return self.fsdp_wrapper.state_dict()
+        return self.checkpoint.full_state_dict()
 
     def load_state_dict(self, state_dict, strict: bool = True):
-        return self.fsdp_wrapper.load_state_dict(state_dict, strict=strict)
+        return self.checkpoint.load_full_state_dict(state_dict, strict=strict)
+
+    def sharded_state_dict(self):
+        return self.checkpoint.sharded_state_dict()
+
+    def load_sharded_state_dict(self, state_dict, strict: bool = True):
+        return self.checkpoint.load_sharded_state_dict(state_dict, strict=strict)
+
+    def save_checkpoint(
+        self,
+        path,
+        *,
+        step: int,
+        dataloader_state=None,
+        eval_dataloader_state=None,
+        metadata=None,
+    ):
+        return self.checkpoint.save(
+            path,
+            step=step,
+            dataloader_state=dataloader_state,
+            eval_dataloader_state=eval_dataloader_state,
+            metadata=metadata,
+        )
+
+    def load_checkpoint(self, path, *, strict: bool = True):
+        return self.checkpoint.load(path, strict=strict)
+
+    def save_full_model(self, path):
+        return self.checkpoint.save_full_model(path)
+
+    def load_full_model(self, path, *, strict: bool = True):
+        return self.checkpoint.load_full_model(path, strict=strict)
         
     def reduce_loss(self, loss):
         loss_log = loss.detach().float().clone()

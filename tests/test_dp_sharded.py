@@ -122,8 +122,11 @@ def _run_fsdp_parity(rank, world_size, rendezvous_file):
 
         actual_state = wrapper.state_dict()
         expected_state = reference.state_dict()
-        for name, expected in expected_state.items():
-            torch.testing.assert_close(actual_state[name], expected)
+        if rank == 0:
+            for name, expected in expected_state.items():
+                torch.testing.assert_close(actual_state[name], expected)
+        else:
+            assert actual_state is None
 
         buffer_model = nn.Module()
         buffer_model.register_buffer("value", torch.tensor(float(rank)))
@@ -206,8 +209,11 @@ def _run_fsdp_rank_local_unused(rank, world_size, rendezvous_file):
         reference_optimizer.step()
 
         actual_state = wrapper.state_dict()
-        for name, expected in reference.state_dict().items():
-            torch.testing.assert_close(actual_state[name], expected)
+        if rank == 0:
+            for name, expected in reference.state_dict().items():
+                torch.testing.assert_close(actual_state[name], expected)
+        else:
+            assert actual_state is None
     finally:
         dist.destroy_process_group()
 

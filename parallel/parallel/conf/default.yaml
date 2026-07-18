@@ -19,6 +19,9 @@ config:
   max_steps: 500
   eval_interval: 10
   eval_steps: 10
+  checkpoint_interval: 0
+  checkpoint_dir: "checkpoints"
+  resume_from: null
 
 engine:
   cpu_offload: false
