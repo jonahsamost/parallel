@@ -35,6 +35,55 @@ def test_parallel_config_rejects_non_positive_dimensions():
         ParallelConfig(_config(dp_replicate=0))
 
 
+def test_parallel_config_allows_tensor_parallel_mesh_dimension(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    config = ParallelConfig(_config(tp=4, dp_shard=2))
+
+    assert config.get_mesh_layout() == (
+        (Strategies.DP_REPLICATE, Strategies.TP, Strategies.DP_SHARD),
+        (1, 4, 2),
+        (8, 1, 4),
+    )
+    assert config.get_mesh_dims() == (
+        (Strategies.TP, Strategies.DP_SHARD),
+        (4, 2),
+    )
+
+
+def test_parallel_config_builds_tp_adjacent_physical_mesh(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+    config = ParallelConfig(_config(tp=4, dp_shard=2))
+
+    mesh_dim_names, mesh_shape, mesh_strides = config.get_mesh_layout()
+    mesh = config._physical_mesh(mesh_dim_names, mesh_shape, mesh_strides)
+
+    assert mesh.tolist() == [
+        [
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+        ],
+    ]
+
+
+def test_parallel_config_rejects_unsupported_mesh_dimensions(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 2)
+
+    with pytest.raises(NotImplementedError, match="tensor parallel"):
+        ParallelConfig(_config(cp=2))
+
+
 class _FakeMesh:
     mesh_dim_names = (Strategies.DP_REPLICATE, Strategies.DP_SHARD)
 

@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 from dataclasses import dataclass, field
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import DictConfig, OmegaConf
 
 from .utils import is_dist_initialized
@@ -20,6 +20,14 @@ class Strategies(str, Enum):
     SP = "sp"
     EP = "ep"
     PP = "pp"
+
+
+_SUPPORTED_MESH_DIMS = (
+    Strategies.DP_REPLICATE,
+    Strategies.TP,
+    Strategies.DP_SHARD,
+)
+_SUPPORTED_MESH_DIM_NAMES = {dim.value for dim in _SUPPORTED_MESH_DIMS}
 
 
 class RuntimeState:
@@ -126,9 +134,15 @@ class ParallelConfig:
             raise ValueError(
                 f"Parallel mesh size {self.total_size} does not match distributed world size {self.world_size}"
             )
-        unsupported = {name: size for name, size in sizes.items() if name not in {"dp_replicate", "dp_shard"} and size > 1}
+        unsupported = {
+            name: size
+            for name, size in sizes.items()
+            if name not in _SUPPORTED_MESH_DIM_NAMES and size > 1
+        }
         if unsupported:
-            raise NotImplementedError(f"Only replicated and sharded data parallelism are implemented: {unsupported}")
+            raise NotImplementedError(
+                f"Only replicated, sharded, and tensor parallel mesh dimensions are implemented: {unsupported}"
+            )
     
     @property
     def dp_size(self):
@@ -178,28 +192,72 @@ class ParallelConfig:
         )
     
     def get_mesh_dims(self):
-        dims = [
-            (Strategies.DP_REPLICATE, self.dp_replicate_size),
-            (Strategies.DP_SHARD, self.dp_shard_size),
-            (Strategies.TP, self.tp_size),
-            (Strategies.CP, self.cp_size),
-            (Strategies.SP, self.sp_size),
-            (Strategies.EP, self.ep_size),
-            (Strategies.PP, self.pp_size),
-        ]
+        dims = self._supported_mesh_dims()
         dims = [x for x in dims if x[1] > 1]
         return tuple(zip(*dims))
+
+    def _supported_mesh_dims(self):
+        dims = [
+            (Strategies.DP_REPLICATE, self.dp_replicate_size),
+            (Strategies.TP, self.tp_size),
+            (Strategies.DP_SHARD, self.dp_shard_size),
+            # (Strategies.CP, self.cp_size),
+            # (Strategies.SP, self.sp_size),
+            # (Strategies.EP, self.ep_size),
+            # (Strategies.PP, self.pp_size),
+        ]
+        return dims
+    
+    def _create_physical_mesh_strides(self, names, strides):
+        return {n: s for n, s in zip(names, strides)}
+
+    def _physical_mesh_strides(self, mesh_dim_names):
+        strides = self._create_physical_mesh_strides(
+            (
+                Strategies.DP_REPLICATE,
+                Strategies.TP,
+                Strategies.DP_SHARD,
+            ),
+            strides=(
+                self.tp_size * self.dp_shard_size,
+                1,
+                self.tp_size,
+            )
+        )
+        return tuple(strides[name] for name in mesh_dim_names)
+
+    def get_mesh_layout(self):
+        """
+        Return the semantic mesh dimensions plus the physical rank strides.
+
+        The semantic order is (dp_replicate, tp, dp_shard), while the default
+        physical layout keeps tensor-parallel ranks adjacent.
+        """
+        dims = self._supported_mesh_dims()
+        mesh_dim_names, mesh_shape = tuple(zip(*dims))
+        mesh_strides = self._physical_mesh_strides(mesh_dim_names)
+        return mesh_dim_names, mesh_shape, mesh_strides
+
+    def _coord_to_rank(self, coord, mesh_strides):
+        return sum(index * stride for index, stride in zip(coord, mesh_strides))
+
+    def _physical_mesh(self, mesh_dim_names, mesh_shape, mesh_strides):
+        mesh = torch.empty(mesh_shape, dtype=torch.int64)
+        for coord in torch.cartesian_prod(*(torch.arange(size) for size in mesh_shape)):
+            coord = tuple(coord.tolist())
+            mesh[coord] = self._coord_to_rank(coord, mesh_strides)
+        return mesh
     
     def set_device_mesh(self, device_type: str):
         self.device_type = device_type
-        dims = self.get_mesh_dims()
-        if len(dims) == 0:
+        if self.total_size == 1:
             self.device_mesh = None
             return None
-        mesh_dim_names, mesh_shape = dims
-        device_mesh = init_device_mesh(
+        mesh_dim_names, mesh_shape, mesh_strides = self.get_mesh_layout()
+        mesh = self._physical_mesh(mesh_dim_names, mesh_shape, mesh_strides)
+        device_mesh = DeviceMesh(
             device_type,
-            mesh_shape,
+            mesh,
             mesh_dim_names=mesh_dim_names,
         )
         self.device_mesh = device_mesh
