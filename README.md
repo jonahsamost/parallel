@@ -17,9 +17,44 @@ Launch fully sharded data parallel training with:
 torchrun --nproc-per-node=8 -m parallel.parallel.train parallel.dp_shard=8
 ```
 
-For hybrid sharded data parallelism, the product of `parallel.dp_replicate` and
-`parallel.dp_shard` must equal the distributed world size. Tensor, context,
-sequence, expert, and pipeline parallel sizes currently must remain `1`.
+With no model-parallel axis enabled, the product of `parallel.dp_replicate` and
+`parallel.dp_shard` must equal the distributed world size.
+
+Dense Qwen3 models support tensor parallelism:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train parallel.tp=4
+```
+
+Qwen3-MoE models use a folded model-parallel group: the same ranks shard
+attention heads with tensor parallelism and experts with expert parallelism:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train \
+  parallel.tp=4 parallel.ep=4 parallel.expert_tp=1
+```
+
+Folded MoE requires `tp == ep`, and expert tensor parallelism currently requires
+`expert_tp == 1`. Attention heads, key/value heads, sharded MLP dimensions,
+experts, and vocabulary size must be divisible by their parallel dimension.
+Parameters are initialized on meta and only each rank's local model-parallel
+checkpoint shards are materialized.
+
+Tensor/expert parallelism composes with the custom FSDP implementation. For
+example, four ranks can form two-rank folded TP/EP groups and independently
+shard each local model-parallel parameter over a two-rank DP-shard group:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train \
+  parallel.tp=2 parallel.ep=2 parallel.expert_tp=1 \
+  parallel.dp_shard=2
+```
+
+The physical world size is `dp_replicate * tp * dp_shard` (`ep` reuses the TP
+axis). Portable full-model checkpoints reconstruct both shard axes, while
+exact-topology training checkpoints retain TP and DP-shard ownership plus
+optimizer and resume state. Sequence parallelism, expert tensor parallelism,
+and model-parallel `torch.compile` remain follow-up work.
 
 The custom FSDP implementation supports static module graphs, gradient
 accumulation, separately sharded trainable and frozen parameters, mixed

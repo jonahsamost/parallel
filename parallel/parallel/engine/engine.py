@@ -7,12 +7,13 @@ from ..utils import DTYPE_DICT
 from .checkpoint import CheckpointManager
 from .dp_sharded import FSDPWrapper
 from ._dp_sharded_utils import local_tensor
+from .model_parallel import ModelParallelWrapper
 
 
 
 class ParallelEngine:
     def __init__(
-        self, model, tokenizer, pconfig, cfg, device,
+        self, model, tokenizer, pconfig, cfg, device, mp_plan=None,
     ):
         self.tokenizer = tokenizer
         self.pconfig = pconfig
@@ -28,6 +29,9 @@ class ParallelEngine:
             enabled=self.use_amp and self.amp_dtype == torch.float16,
         )
 
+        self.mp_wrapper = ModelParallelWrapper(
+            model, pconfig, device=device, plan=mp_plan
+        )
         self.fsdp_wrapper = FSDPWrapper(
             model,
             pconfig,
@@ -43,6 +47,7 @@ class ParallelEngine:
             device=device,
         )
         self.fsdp_wrapper.shard_model()
+        self.mp_wrapper.attach_fsdp(self.fsdp_wrapper)
         self.model = model
         self.optimizer_params = self.fsdp_wrapper.get_optimizer_params()
         self._sync_initial_state()
@@ -86,8 +91,12 @@ class ParallelEngine:
     def forward(self, x, y):
         self.sync_buffers()
         with torch.autocast(device_type=self.pconfig.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
-            loss = self.model(input_ids=x, labels=y)
-        return loss
+            if self.mp_wrapper.is_active:
+                outputs = self.model(input_ids=x)
+                outputs.loss = self.mp_wrapper.training_loss(outputs, y)
+            else:
+                outputs = self.model(input_ids=x, labels=y)
+        return outputs
 
     def sync_buffers(self):
         if self.pconfig.device_mesh is None:
@@ -103,10 +112,11 @@ class ParallelEngine:
     
     def backward(self, loss):
         self.fsdp_wrapper.prepare_backward(loss)
-        if self.grad_scaler.is_enabled():
-            self.grad_scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        with self.mp_wrapper.backward_context():
+            if self.grad_scaler.is_enabled():
+                self.grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
         self.fsdp_wrapper.finalize_backward()
     
     def step(self):
@@ -128,7 +138,12 @@ class ParallelEngine:
 
         grads_are_finite = self._grads_are_finite()
         if grads_are_finite and self.cfg.model.clip_grad_norm > 0.0:
-            self.fsdp_wrapper.clip_grad_norm_(self.cfg.model.clip_grad_norm)
+            if self.mp_wrapper.is_active:
+                self.mp_wrapper.clip_grad_norm_(
+                    self.optimizer_params, self.cfg.model.clip_grad_norm
+                )
+            else:
+                self.fsdp_wrapper.clip_grad_norm_(self.cfg.model.clip_grad_norm)
 
         if not grads_are_finite:
             if not self.grad_scaler.is_enabled():
@@ -180,7 +195,11 @@ class ParallelEngine:
                 break
 
         if self.pconfig.device_mesh is not None:
-            for dim in (Strategies.DP_REPLICATE, Strategies.DP_SHARD):
+            for dim in (
+                Strategies.DP_REPLICATE,
+                Strategies.TP,
+                Strategies.DP_SHARD,
+            ):
                 if dim in self.pconfig.device_mesh.mesh_dim_names:
                     group = self.pconfig.device_mesh.get_group(dim)
                     dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=group)
@@ -238,3 +257,6 @@ class ParallelEngine:
             dist.all_reduce(loss_log, op=dist.ReduceOp.SUM, group=dp_group)
             loss_log.div_(world_size)
         return loss_log
+
+    def token_loss(self, logits, labels, reduction: str = "mean"):
+        return self.mp_wrapper.token_loss(logits, labels, reduction=reduction)

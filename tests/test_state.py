@@ -41,7 +41,7 @@ def test_parallel_config_allows_tensor_parallel_mesh_dimension(monkeypatch):
     monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
     monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
 
-    config = ParallelConfig(_config(tp=4, dp_shard=2))
+    config = ParallelConfig(_config(tp=4, ep=4, dp_shard=2))
 
     assert config.get_mesh_layout() == (
         (Strategies.DP_REPLICATE, Strategies.TP, Strategies.DP_SHARD),
@@ -54,12 +54,39 @@ def test_parallel_config_allows_tensor_parallel_mesh_dimension(monkeypatch):
     )
 
 
+def test_parallel_config_folds_equal_tensor_and_expert_parallel_sizes(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    config = ParallelConfig(_config(tp=4, ep=4, dp_shard=2))
+
+    assert config.model_parallel_size == 4
+    assert config.total_size == 8
+    assert config.get_mesh_layout() == (
+        (Strategies.DP_REPLICATE, Strategies.TP, Strategies.DP_SHARD),
+        (1, 4, 2),
+        (8, 1, 4),
+    )
+
+
+def test_parallel_config_rejects_unfolded_tensor_and_expert_sizes(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    with pytest.raises(ValueError, match="tp == ep"):
+        ParallelConfig(_config(tp=4, ep=2, dp_shard=2))
+
+
 def test_parallel_config_builds_tp_adjacent_physical_mesh(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
     monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
     monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
-    config = ParallelConfig(_config(tp=4, dp_shard=2))
+    config = ParallelConfig(_config(tp=4, ep=4, dp_shard=2))
 
     mesh_dim_names, mesh_shape, mesh_strides = config.get_mesh_layout()
     mesh = config._physical_mesh(mesh_dim_names, mesh_shape, mesh_strides)
@@ -72,6 +99,17 @@ def test_parallel_config_builds_tp_adjacent_physical_mesh(monkeypatch):
             [3, 7],
         ],
     ]
+
+
+def test_parallel_config_allows_dense_tensor_parallel_without_expert_parallel(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    config = ParallelConfig(_config(tp=4, dp_shard=2))
+    assert config.tp_size == 4
+    assert config.ep_size == 1
 
 
 def test_parallel_config_rejects_unsupported_mesh_dimensions(monkeypatch):

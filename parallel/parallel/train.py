@@ -2,10 +2,11 @@ from omegaconf import OmegaConf
 from pathlib import Path
 import time
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from .dataloader import dist_data_loader
 from .engine.engine import ParallelEngine
+from .engine.model_loading import load_causal_lm
 from .eval import eval_bpb, get_token_bytes
 from .logging import get_logger
 from .state import ParallelConfig, RuntimeState, init_dist
@@ -28,11 +29,7 @@ def main():
     ### rngs
     pconfig.model_init_rngs(seed=cfg.get("seed", 42))
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.name,
-        device_map=None,
-        attn_implementation="sdpa",
-    )
+    model, mp_plan = load_causal_lm(cfg, pconfig)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name,)
     logger.info("Collecting token bytes...")
     token_bytes = get_token_bytes(tokenizer)
@@ -43,12 +40,16 @@ def main():
         raise NotImplementedError(
             "torch.compile is not yet supported with the custom FSDP implementation"
         )
-    if pconfig.dp_shard_size <= 1:
+    if cfg.engine.compile and pconfig.model_parallel_enabled:
+        raise NotImplementedError(
+            "torch.compile is not yet supported with folded model parallelism"
+        )
+    if pconfig.dp_shard_size <= 1 and not pconfig.model_parallel_enabled:
         model.to(device)
     model.train()
 
     pengine = ParallelEngine(
-        model, tokenizer, pconfig, cfg, device
+        model, tokenizer, pconfig, cfg, device, mp_plan=mp_plan
     )
     if cfg.engine.compile:
         logger.info("Model loaded. Compiling...")
@@ -127,7 +128,8 @@ def main():
             pengine.sync_buffers()
             bpb, eval_dataloader_state = eval_bpb(
                 model, eval_dataloader, cfg.config.eval_steps,
-                device, pconfig, pengine.use_amp, pengine.amp_dtype, token_bytes
+                device, pconfig, pengine.use_amp, pengine.amp_dtype, token_bytes,
+                loss_fn=pengine.token_loss,
             )
             wandb.log({"eval/loss": bpb, "step": step}, step=step)
 

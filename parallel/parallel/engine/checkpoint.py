@@ -55,6 +55,9 @@ class CheckpointManager:
 
     @property
     def wrapper(self):
+        model_parallel = getattr(self.engine, "mp_wrapper", None)
+        if model_parallel is not None and model_parallel.is_active:
+            return model_parallel
         return self.engine.fsdp_wrapper
 
     @property
@@ -74,6 +77,15 @@ class CheckpointManager:
     @property
     def shard_rank(self) -> int:
         return self._mesh_rank(Strategies.DP_SHARD)
+
+    @property
+    def tp_rank(self) -> int:
+        return self._mesh_rank(Strategies.TP)
+
+    @property
+    def model_parallel_active(self) -> bool:
+        wrapper = getattr(self.engine, "mp_wrapper", None)
+        return wrapper is not None and wrapper.is_active
 
     @property
     def is_model_writer(self) -> bool:
@@ -99,6 +111,9 @@ class CheckpointManager:
             "world_size": self.world_size,
             "dp_replicate_size": getattr(pconfig, "dp_replicate_size", 1),
             "dp_shard_size": getattr(pconfig, "dp_shard_size", 1),
+            "tp_size": getattr(pconfig, "tp_size", 1),
+            "ep_size": getattr(pconfig, "ep_size", 1),
+            "expert_tp_size": getattr(pconfig, "expert_tp_size", 1),
         }
 
     def _resolved_config(self) -> Any:
@@ -197,8 +212,24 @@ class CheckpointManager:
             raise RuntimeError(f"Failed to initialize checkpoint: {result['error']}")
         return Path(result["path"])
 
-    def _model_file_name(self, shard_rank: int) -> str:
+    def _model_file_name(self, shard_rank: int, tp_rank: int | None = None) -> str:
+        if self.model_parallel_active:
+            tp_rank = self.tp_rank if tp_rank is None else tp_rank
+            return f"model-tp-{tp_rank:05d}-dp-shard-{shard_rank:05d}.pt"
         return f"model-shard-{shard_rank:05d}.pt"
+
+    def _model_file_names(self) -> list[str]:
+        topology = self._topology()
+        if self.model_parallel_active:
+            return [
+                self._model_file_name(dp_shard_rank, tp_rank)
+                for tp_rank in range(topology["tp_size"])
+                for dp_shard_rank in range(topology["dp_shard_size"])
+            ]
+        return [
+            self._model_file_name(shard_rank)
+            for shard_rank in range(topology["dp_shard_size"])
+        ]
 
     def _rank_file_name(self, rank: int) -> str:
         return f"rank-state-{rank:05d}.pt"
@@ -225,7 +256,9 @@ class CheckpointManager:
                 }
                 torch.save(
                     model_payload,
-                    temporary / self._model_file_name(self.shard_rank),
+                    temporary / self._model_file_name(
+                        self.shard_rank, self.tp_rank
+                    ),
                 )
 
             scaler = getattr(self.engine, "grad_scaler", None)
@@ -259,10 +292,7 @@ class CheckpointManager:
                     "step": int(step),
                     "topology": self._topology(),
                     "layout": self.wrapper.checkpoint_layout(),
-                    "model_files": [
-                        self._model_file_name(shard_rank)
-                        for shard_rank in range(dp_shard_size)
-                    ],
+                    "model_files": self._model_file_names(),
                     "rank_files": [
                         self._rank_file_name(rank) for rank in range(self.world_size)
                     ],
@@ -325,10 +355,7 @@ class CheckpointManager:
             )
         if manifest.get("layout") != self.wrapper.checkpoint_layout():
             raise RuntimeError("Checkpoint model layout does not match the current model")
-        expected_model_files = [
-            self._model_file_name(shard_rank)
-            for shard_rank in range(self._topology()["dp_shard_size"])
-        ]
+        expected_model_files = self._model_file_names()
         expected_rank_files = [
             self._rank_file_name(rank) for rank in range(self.world_size)
         ]
@@ -341,7 +368,7 @@ class CheckpointManager:
         rank_payload = None
         try:
             model_payload = torch.load(
-                path / self._model_file_name(self.shard_rank),
+                path / self._model_file_name(self.shard_rank, self.tp_rank),
                 map_location="cpu",
                 weights_only=False,
             )

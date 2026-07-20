@@ -4,6 +4,7 @@ model:
   per_device_batch_size: 4
   learning_rate: 1e-5
   clip_grad_norm: 1.0
+  output_router_logits: true
 
 optim:
   adam_beta1: 0.9
@@ -42,4 +43,5 @@ parallel:
   cp: 1
   sp: 1
   ep: 1
+  expert_tp: 1
   pp: 1

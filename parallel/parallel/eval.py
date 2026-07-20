@@ -17,7 +17,8 @@ def get_token_bytes(tokenizer):
 
 @torch.no_grad()
 def eval_bpb(
-    model, dataloader, eval_steps, device, pconfig, use_amp, amp_dtype, token_bytes
+    model, dataloader, eval_steps, device, pconfig, use_amp, amp_dtype, token_bytes,
+    loss_fn=None,
 ):
     # bpb = cross_entropy_loss_per_token × (tokens / bytes) × (1 / ln(2))
     model.eval()
@@ -30,11 +31,14 @@ def eval_bpb(
         x, y, dataloader_state = next(dataloader)
         with torch.autocast(device_type=pconfig.device_type, dtype=amp_dtype, enabled=use_amp):
             logits = model(input_ids=x).logits
-        loss_per_token = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            y.view(-1),
-            reduction="none"
-        )
+        if loss_fn is None:
+            loss_per_token = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
+                reduction="none"
+            )
+        else:
+            loss_per_token = loss_fn(logits, y, reduction="none")
         num_bytes = token_bytes[y.view(-1)]
         valid = num_bytes > 0
         total_nats += (loss_per_token * valid).sum()

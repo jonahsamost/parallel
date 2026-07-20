@@ -91,6 +91,7 @@ class ParallelConfig:
     cp_size: Optional[int] = None
     sp_size: Optional[int] = None
     ep_size: Optional[int] = None
+    expert_tp_size: Optional[int] = None
     pp_size: Optional[int] = None
     device_mesh = None
     device_type = None
@@ -107,6 +108,7 @@ class ParallelConfig:
         self.cp_size = conf.cp
         self.sp_size = conf.sp
         self.ep_size = conf.ep
+        self.expert_tp_size = getattr(conf, "expert_tp", 1)
         self.pp_size = conf.pp
 
         self.rank = dist.get_rank() if is_dist_initialized() else 0
@@ -125,6 +127,7 @@ class ParallelConfig:
             "cp": self.cp_size,
             "sp": self.sp_size,
             "ep": self.ep_size,
+            "expert_tp": self.expert_tp_size,
             "pp": self.pp_size,
         }
         invalid = {name: size for name, size in sizes.items() if not isinstance(size, int) or size < 1}
@@ -137,11 +140,21 @@ class ParallelConfig:
         unsupported = {
             name: size
             for name, size in sizes.items()
-            if name not in _SUPPORTED_MESH_DIM_NAMES and size > 1
+            if name not in _SUPPORTED_MESH_DIM_NAMES
+            and name not in {"ep", "expert_tp"}
+            and size > 1
         }
         if unsupported:
             raise NotImplementedError(
                 f"Only replicated, sharded, and tensor parallel mesh dimensions are implemented: {unsupported}"
+            )
+        if self.expert_tp_size != 1:
+            raise NotImplementedError(
+                "Expert tensor parallelism is not implemented yet; expert_tp must be 1"
+            )
+        if self.ep_size > 1 and self.tp_size != self.ep_size:
+            raise ValueError(
+                "Folded expert parallelism requires tp == ep"
             )
     
     @property
@@ -151,6 +164,15 @@ class ParallelConfig:
     @property
     def dp_enabled(self):
         return self.dp_size > 1
+
+    @property
+    def model_parallel_size(self):
+        """Physical size of the rank group shared by attention TP and MoE EP."""
+        return max(self.tp_size, self.ep_size)
+
+    @property
+    def model_parallel_enabled(self):
+        return self.model_parallel_size > 1
     
     @property
     def is_distributed(self):
@@ -179,6 +201,7 @@ class ParallelConfig:
             f"\tcp_size={self.cp_size},\n"
             f"\tsp_size={self.sp_size},\n"
             f"\tep_size={self.ep_size},\n"
+            f"\texpert_tp_size={self.expert_tp_size},\n"
             f"\tpp_size={self.pp_size},\n"
             f"\ttotal_size={self.total_size}\n"
         )
@@ -187,8 +210,8 @@ class ParallelConfig:
     def total_size(self):
         return (
             self.dp_replicate_size * self.dp_shard_size
-            * self.tp_size * self.cp_size * self.sp_size
-            * self.ep_size * self.pp_size
+            * self.model_parallel_size * self.cp_size * self.sp_size
+            * self.pp_size
         )
     
     def get_mesh_dims(self):

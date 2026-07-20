@@ -694,6 +694,67 @@ class FSDPWrapper:
             validation["missing"], validation["unexpected"]
         )
 
+    def load_local_full_state_dict(self, state_dict, strict: bool = True):
+        """Load one full local model-parallel shard through its DP-shard group."""
+        if not self.is_active:
+            return self.load_full_state_dict(state_dict, strict=strict)
+        if not self._state_dict_keys:
+            self._capture_state_dict_layout()
+
+        group_root = dist.get_global_rank(self.dp_shard_group, 0)
+        is_group_root = dist.get_rank(self.dp_shard_group) == 0
+        if self._is_checkpoint_replica():
+            validation = (
+                self._validate_full_state_dict(state_dict, strict)
+                if is_group_root
+                else None
+            )
+            payload = [validation]
+            dist.broadcast_object_list(
+                payload,
+                src=group_root,
+                group=self.dp_shard_group,
+            )
+            validation = payload[0]
+            if validation["error"] is not None:
+                raise RuntimeError(
+                    f"Error(s) in loading local state_dict: {validation['error']}"
+                )
+
+            for unit in self.units:
+                unit.all_gather()
+                try:
+                    if is_group_root:
+                        metas_by_name = {
+                            name: meta
+                            for meta in unit.param_metas
+                            for name in self._parameter_state_names[id(meta.parameter)]
+                        }
+                        for name, meta in metas_by_name.items():
+                            if name in state_dict:
+                                meta.parameter.detach().copy_(state_dict[name])
+                    for buffer in unit._full_params_buf:
+                        dist.broadcast(
+                            buffer,
+                            src=group_root,
+                            group=self.dp_shard_group,
+                        )
+                    unit.writeback_shards()
+                finally:
+                    unit.free_full_params()
+
+            if is_group_root:
+                self._copy_non_parameter_state(state_dict)
+            for buffer in self.model.buffers():
+                self._sync_tensor(buffer, self.dp_shard_group)
+        else:
+            validation = {"missing": [], "unexpected": []}
+
+        self._sync_replicated_state()
+        return nn.modules.module._IncompatibleKeys(
+            validation["missing"], validation["unexpected"]
+        )
+
     def checkpoint_layout(self) -> dict[str, Any]:
         return {
             "state_dict_keys": list(self._state_dict_keys),
