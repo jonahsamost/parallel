@@ -20,7 +20,24 @@ from ._dp_sharded_utils import (
 
 
 class FSDPWrapper:
-    """ Wraps a model for FSDP """
+    """ Wraps a model for FSDP 
+    
+    Note on find_unused_parameters:
+
+    when false -> the normal path (for dense models). The engine assumes that every trainable
+    parameter receives a gradient. Every DP-shard rank uses the same FSDP units. 
+        all-gather layer N parameters
+        compute layer N gradients
+        reduce-scatter layer N gradients
+        free temporary full parameters and gradients
+        continue to layer N-1
+    when true -> inspect which parameters each rank uses and coordinate comms when
+        their backward graphs differ
+
+    really we want to know if any trainable parameter can have `param.grad is None` on this step,
+        especially on only some ranks. 
+    
+    """
 
     def __init__(
         self,
@@ -29,6 +46,8 @@ class FSDPWrapper:
         cpu_offload: bool = False,
         activation_checkpoint: bool = False,
         checkpoint_every_n: int = 1,
+        find_unused_parameters: bool = False,
+        overlap_backward_reductions: bool = True,
         device: Optional[torch.device] = None,
     ):
         self.model = model
@@ -36,6 +55,8 @@ class FSDPWrapper:
         self.cpu_offload = cpu_offload
         self.activation_checkpoint = activation_checkpoint
         self.checkpoint_every_n = max(checkpoint_every_n, 1)
+        self.find_unused_parameters = find_unused_parameters
+        self.overlap_backward_reductions = overlap_backward_reductions
         first_parameter = next(model.parameters(), None)
         self.device = device or (
             first_parameter.device if first_parameter is not None else torch.device("cpu")
@@ -51,7 +72,10 @@ class FSDPWrapper:
         self._inflight_backward_positions: list[int] = []
         self._max_inflight_gradient_reductions: int = 2
         self._backward_prepared: bool = False
-        self._defer_backward_collectives: bool = False
+        self._globally_used_backward_positions: list[bool] = []
+        self._global_parameter_participation: dict[int, list[bool]] = {}
+        self._deferred_backward_positions: list[int] = []
+        self._reduced_backward_positions: set[int] = set()
         self._state_dict_keys: tuple[str, ...] = ()
         self._parameter_state_names: dict[int, tuple[str, ...]] = {}
         self._parameter_state_keys: set[str] = set()
@@ -173,28 +197,21 @@ class FSDPWrapper:
         self._ready_backward_positions.clear()
         self._next_backward_position = len(self._backward_units) - 1
         self._inflight_backward_positions.clear()
+        self._deferred_backward_positions.clear()
+        self._reduced_backward_positions.clear()
         for unit in self._backward_units:
             unit.set_backward_ready_callback(self._on_unit_gradients_ready)
 
     def prepare_backward(self, loss: torch.Tensor):
-        """Prepare a collective-safe reduction schedule for this backward graph.
+        """Prepare either the fast or usage-aware backward schedule.
 
-        Autograd graphs may differ across shard ranks when model control flow is
-        rank-dependent (think MoE where some ranks may have no tokens routed
-        to their expert).
-        
-        One rank may consider a unit locally unused and become ready to reduce-scatter
-        its zero gradient, while another rank still needs to all-gather that unit's
-        parameters because they were resharded after forward. These different collectives
-        cannot be issued concurrently in different orders on the same process group.
-
-        We discover the locally used parameters from ``loss`` and sum a unit
-        usage bitmap across the shard group. A count of zero means globally
-        unused, ``world_size`` means universally used, and an intermediate
-        count means the ranks have divergent backward graphs. For divergence,
-        every rank gathers the union of used units in a fixed order before
-        autograd and defers reduce-scatters until backward has completed. When
-        all ranks agree, the normal overlapped backward schedule remains active.
+        The fast path assumes every rank reaches the same trainable parameters
+        in compatible reverse-unit order. The usage-aware path discovers the
+        local autograd graph, sums one combined unit/parameter bitmap across
+        the shard group, and lets the wrapper issue just-in-time all-gathers on
+        every rank. A locally unused rank therefore still contributes its
+        parameter shard and later supplies zero gradients for a globally used
+        unit without materializing all units before backward.
         """
         if not self.is_active:
             return
@@ -203,61 +220,75 @@ class FSDPWrapper:
         if self._backward_prepared:
             raise RuntimeError("FSDP backward is already prepared")
 
+        self._ready_backward_positions.clear()
+        self._deferred_backward_positions.clear()
+        self._reduced_backward_positions.clear()
+        self._global_parameter_participation.clear()
+        self._next_backward_position = len(self._backward_units) - 1
+
+        if not self.find_unused_parameters:
+            self._globally_used_backward_positions = [
+                True for _ in self._backward_units
+            ]
+            for position, unit in enumerate(self._backward_units):
+                unit.managed_backward_unshard = False
+                if unit.prepare_backward(None):
+                    self._ready_backward_positions.add(position)
+            self._backward_prepared = True
+            return
+
         parameter_ids = {
             parameter_id
             for unit in self._backward_units
             for parameter_id in unit.parameter_ids
         }
         used_parameter_ids = discover_used_parameter_ids(loss, parameter_ids)
-        local_used_units = torch.tensor(
-            [
-                int(bool(unit.parameter_ids.intersection(used_parameter_ids)))
-                for unit in self._backward_units
-            ],
+        local_unit_usage = [
+            int(bool(unit.parameter_ids.intersection(used_parameter_ids)))
+            for unit in self._backward_units
+        ]
+        local_parameter_usage = [
+            int(id(meta.parameter) in used_parameter_ids)
+            for unit in self._backward_units
+            for meta in unit.param_metas
+        ]
+        usage_counts = torch.tensor(
+            local_unit_usage + local_parameter_usage,
             dtype=torch.int32,
             device=self.device,
         )
-        used_unit_counts = local_used_units.clone()
-        if self._backward_units:
+        if usage_counts.numel():
             dist.all_reduce(
-                used_unit_counts,
+                usage_counts,
                 op=dist.ReduceOp.SUM,
                 group=self.dp_shard_group,
             )
-        shard_world_size = dist.get_world_size(self.dp_shard_group)
-        globally_used_units = used_unit_counts > 0
-        divergent_units = (used_unit_counts > 0) & (
-            used_unit_counts < shard_world_size
-        )
-        # When any unit has divergent usage, the current conservative fallback does this:
-        #   Before backward, every rank all-gathers every globally used unit in the same order.
-        #   Backward runs without additional parameter all-gathers.
-        #   Used ranks accumulate real full gradients.
-        #   Unused ranks accumulate nothing.
-        #   After backward returns, all ranks issue reduce-scatters in one fixed order.
-        #   Locally missing gradients are represented by zero buffers.
-        self._defer_backward_collectives = bool(divergent_units.any().item())
 
-        zero_ready_positions: set[int] = set()
+        unit_count = len(self._backward_units)
+        self._globally_used_backward_positions = [
+            bool(value)
+            for value in usage_counts[:unit_count].gt(0).tolist()
+        ]
+        parameter_counts = usage_counts[unit_count:]
+        parameter_offset = 0
         for position, unit in enumerate(self._backward_units):
+            parameter_count = len(unit.param_metas)
+            self._global_parameter_participation[position] = [
+                bool(value)
+                for value in parameter_counts[
+                    parameter_offset : parameter_offset + parameter_count
+                ].gt(0).tolist()
+            ]
+            parameter_offset += parameter_count
+            unit.managed_backward_unshard = True
             if unit.prepare_backward(used_parameter_ids):
-                zero_ready_positions.add(position)
-            unit.defer_backward_prefetch = self._defer_backward_collectives
+                self._ready_backward_positions.add(position)
 
-        self._ready_backward_positions.update(zero_ready_positions)
-        if self._defer_backward_collectives:
-            for position, unit in enumerate(self._backward_units):
-                if globally_used_units[position].item():
-                    unit.all_gather()
         self._backward_prepared = True
+        self._advance_usage_aware_backward()
 
     def _on_unit_gradients_ready(self, unit: DPParamUnit):
-        """
-        Record local readiness and drain only the next globally ordered units.
-        
-        Every gradient that local autograd is expected to produce for this unit now exists.
-        Does not mean that _every rank_ is ready. 
-        """
+        """Record local readiness and advance the configured global schedule."""
         if not self._backward_prepared:
             raise RuntimeError("FSDP unit became ready before prepare_backward()")
         try:
@@ -265,22 +296,65 @@ class FSDPWrapper:
         except KeyError as error:
             raise RuntimeError("Unknown FSDP unit reported gradient readiness") from error
         self._ready_backward_positions.add(position)
-        if not self._defer_backward_collectives:
+        if self.find_unused_parameters:
+            self._advance_usage_aware_backward()
+        elif self.overlap_backward_reductions:
             self._drain_backward_reductions()
+
+    def _launch_gradient_reduction(self, position: int) -> None:
+        while (
+            len(self._inflight_backward_positions)
+            >= self._max_inflight_gradient_reductions
+        ):
+            oldest_position = self._inflight_backward_positions.pop(0)
+            self._backward_units[oldest_position].finish_gradient_reduction()
+        self._backward_units[position].start_gradient_reduction()
+        self._inflight_backward_positions.append(position)
+        self._reduced_backward_positions.add(position)
 
     def _drain_backward_reductions(self):
         while self._next_backward_position in self._ready_backward_positions:
             position = self._next_backward_position
             self._ready_backward_positions.remove(position)
-            while (
-                len(self._inflight_backward_positions)
-                >= self._max_inflight_gradient_reductions
-            ):
-                oldest_position = self._inflight_backward_positions.pop(0)
-                self._backward_units[oldest_position].finish_gradient_reduction()
-            self._backward_units[position].start_gradient_reduction()
-            self._inflight_backward_positions.append(position)
+            self._launch_gradient_reduction(position)
             self._next_backward_position -= 1
+
+    def _advance_usage_aware_backward(self) -> None:
+        """Advance the globally ordered just-in-time backward schedule.
+
+        Each globally used unit is unsharded before this rank either waits for
+        its real gradients or immediately contributes zeros. With overlap, the
+        per-rank collective order is ``AG(unit), RS(unit), AG(previous), ...``.
+        Without overlap, all just-in-time all-gathers happen during backward
+        and the fixed-order reduce-scatters are launched during finalization.
+        """
+        while self._next_backward_position >= 0:
+            position = self._next_backward_position
+            if not self._globally_used_backward_positions[position]:
+                self._next_backward_position -= 1
+                continue
+
+            unit = self._backward_units[position]
+            unit.schedule_backward_unshard()
+            if position not in self._ready_backward_positions:
+                return
+
+            self._ready_backward_positions.remove(position)
+            if self.overlap_backward_reductions:
+                self._launch_gradient_reduction(position)
+            else:
+                unit.free_full_params()
+                self._deferred_backward_positions.append(position)
+            self._next_backward_position -= 1
+
+    def _launch_deferred_backward_reductions(self) -> None:
+        positions = (
+            self._deferred_backward_positions
+            if self.find_unused_parameters
+            else list(range(len(self._backward_units) - 1, -1, -1))
+        )
+        for position in positions:
+            self._launch_gradient_reduction(position)
 
     def _wire_prefetch(self):
         """Link each unit to the next unit for forward/backward prefetch."""
@@ -316,24 +390,20 @@ class FSDPWrapper:
         if not self._backward_prepared:
             raise RuntimeError("FSDP backward was not prepared before finalization")
 
-        if not self._defer_backward_collectives:
-            # This is needed when the entire local model was unused and no
-            # parameter hook fired to kick the precomputed zero-ready schedule.
+        if self.find_unused_parameters:
+            self._advance_usage_aware_backward()
+        elif self.overlap_backward_reductions:
             self._drain_backward_reductions()
-        missing_ready_positions = (
-            [
+        else:
+            missing_positions = [
                 position
-                for position in range(len(self._backward_units))
-                if position not in self._ready_backward_positions
+                for position, unit in enumerate(self._backward_units)
+                if not unit.backward_ready
             ]
-            if self._defer_backward_collectives
-            else (
-                []
-                if self._next_backward_position == -1
-                else [self._next_backward_position]
-            )
-        )
-        if missing_ready_positions:
+            if not missing_positions:
+                self._next_backward_position = -1
+
+        if self._next_backward_position != -1:
             pending = [
                 {
                     "unit": unit.unit_index,
@@ -346,33 +416,38 @@ class FSDPWrapper:
                 "FSDP backward ended before every expected parameter gradient "
                 f"was accumulated: {pending}"
             )
-        if self._defer_backward_collectives:
-            self._drain_backward_reductions()
+
+        if not self.overlap_backward_reductions:
+            self._launch_deferred_backward_reductions()
 
         if self._backward_units:
             for position in self._inflight_backward_positions:
                 self._backward_units[position].finish_gradient_reduction()
             self._inflight_backward_positions.clear()
 
-            participated = torch.tensor(
-                [int(unit.local_gradient_participated) for unit in self._backward_units],
-                dtype=torch.int32,
-                device=self._backward_units[0].device,
-            )
-            dist.all_reduce(participated, op=dist.ReduceOp.MAX, group=self.dp_shard_group)
+            if not self.find_unused_parameters:
+                for position, unit in enumerate(self._backward_units):
+                    self._global_parameter_participation[position] = [
+                        True for _ in unit.param_metas
+                    ]
+
             for position in range(len(self._backward_units) - 1, -1, -1):
-                self._backward_units[position].accumulate_reduced_gradient(
-                    accumulate=bool(participated[position].item())
+                if position not in self._reduced_backward_positions:
+                    continue
+                self._backward_units[position].accumulate_reduced_gradients(
+                    self._global_parameter_participation[position]
                 )
         for unit in self.units:
             unit.free_full_params()
             unit.reset_backward_state()
-            unit.defer_backward_prefetch = False
 
         self._ready_backward_positions.clear()
         self._next_backward_position = len(self._backward_units) - 1
         self._backward_prepared = False
-        self._defer_backward_collectives = False
+        self._globally_used_backward_positions.clear()
+        self._global_parameter_participation.clear()
+        self._deferred_backward_positions.clear()
+        self._reduced_backward_positions.clear()
 
     def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
         """Clip using one norm shared by every rank in the shard group."""

@@ -1,6 +1,6 @@
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -184,7 +184,13 @@ def _run_unused_grad_sync(rank, world_size, rendezvous_file):
         dist.destroy_process_group()
 
 
-def _run_fsdp_rank_local_unused(rank, world_size, rendezvous_file):
+def _run_fsdp_rank_local_unused(
+    rank,
+    world_size,
+    rendezvous_file,
+    overlap_backward_reductions=True,
+    activation_checkpoint=False,
+):
     dist.init_process_group(
         backend="gloo",
         init_method=f"file://{rendezvous_file}",
@@ -199,7 +205,14 @@ def _run_fsdp_rank_local_unused(rank, world_size, rendezvous_file):
 
         mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp_shard",))
         pconfig = SimpleNamespace(dp_shard_size=world_size, device_mesh=mesh)
-        wrapper = FSDPWrapper(model, pconfig, device=torch.device("cpu"))
+        wrapper = FSDPWrapper(
+            model,
+            pconfig,
+            find_unused_parameters=True,
+            overlap_backward_reductions=overlap_backward_reductions,
+            activation_checkpoint=activation_checkpoint,
+            device=torch.device("cpu"),
+        )
         wrapper.shard_model()
 
         optimizer = torch.optim.SGD(wrapper.get_optimizer_params(), lr=0.1, weight_decay=0.1)
@@ -275,22 +288,47 @@ def test_fsdp_synchronizes_rank_local_unused_gradients_in_fixed_order(tmp_path):
     )
 
 
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_fsdp_can_defer_rank_local_unused_gradient_reductions(tmp_path):
+    world_size = 2
+    rendezvous_file = tmp_path / "rendezvous"
+    mp.spawn(
+        _run_fsdp_rank_local_unused,
+        args=(world_size, rendezvous_file, False),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_fsdp_rank_local_unused_with_activation_checkpointing(tmp_path):
+    world_size = 2
+    rendezvous_file = tmp_path / "rendezvous"
+    mp.spawn(
+        _run_fsdp_rank_local_unused,
+        args=(world_size, rendezvous_file, True, True),
+        nprocs=world_size,
+        join=True,
+    )
+
+
 def test_backward_reducer_drains_ready_units_in_reverse_order():
     calls = []
     units = []
     for index in range(3):
         unit = Mock(requires_grad=True, unit_index=index)
         unit.device = torch.device("cpu")
+        unit.param_metas = [Mock()]
         unit.start_gradient_reduction.side_effect = (
             lambda current=index: calls.append(("start", current))
         )
-        unit.local_gradient_participated = True
+        unit.local_gradient_participation = [True]
         unit.finish_gradient_reduction.side_effect = (
             lambda current=index: calls.append(("finish", current))
         )
-        unit.accumulate_reduced_gradient.side_effect = (
-            lambda *, accumulate, current=index: calls.append(
-                ("accumulate", current, accumulate)
+        unit.accumulate_reduced_gradients.side_effect = (
+            lambda accumulate, current=index: calls.append(
+                ("accumulate", current, list(accumulate))
             )
         )
         units.append(unit)
@@ -303,7 +341,12 @@ def test_backward_reducer_drains_ready_units_in_reverse_order():
     wrapper._next_backward_position = -1
     wrapper._inflight_backward_positions = []
     wrapper._max_inflight_gradient_reductions = 2
-    wrapper._defer_backward_collectives = False
+    wrapper.find_unused_parameters = False
+    wrapper.overlap_backward_reductions = True
+    wrapper._globally_used_backward_positions = []
+    wrapper._global_parameter_participation = {}
+    wrapper._deferred_backward_positions = []
+    wrapper._reduced_backward_positions = set()
     wrapper.dp_shard_group = Mock()
     wrapper._initialize_backward_reducer()
     wrapper._backward_prepared = True
@@ -319,9 +362,7 @@ def test_backward_reducer_drains_ready_units_in_reverse_order():
         ("start", 0),
     ]
 
-    with patch.object(dist, "all_reduce") as all_reduce:
-        wrapper.finalize_backward()
-    all_reduce.assert_called_once()
+    wrapper.finalize_backward()
     assert calls == [
         ("start", 2),
         ("start", 1),
@@ -329,9 +370,9 @@ def test_backward_reducer_drains_ready_units_in_reverse_order():
         ("start", 0),
         ("finish", 1),
         ("finish", 0),
-        ("accumulate", 2, True),
-        ("accumulate", 1, True),
-        ("accumulate", 0, True),
+        ("accumulate", 2, [True]),
+        ("accumulate", 1, [True]),
+        ("accumulate", 0, [True]),
     ]
     for unit in units:
         unit.reset_backward_state.assert_called_once_with()
@@ -346,6 +387,7 @@ def test_backward_hooks_launch_reduction_before_finalize(tmp_path):
         wrapper = FSDPWrapper(
             model,
             SimpleNamespace(dp_shard_size=2, device_mesh=mesh),
+            find_unused_parameters=True,
             device=torch.device("cpu"),
         )
         wrapper.shard_model()
@@ -353,11 +395,19 @@ def test_backward_hooks_launch_reduction_before_finalize(tmp_path):
         inputs = torch.arange(8, dtype=torch.float32).view(2, 4).div(10)
         loss = model(inputs, 0).div(2)
         wrapper.prepare_backward(loss)
+
+        # Usage-aware scheduling starts only the globally next unit. It does
+        # not bulk-materialize the selected branch before backward reaches it.
+        assert wrapper.units[3]._full_params_buf is not None
+        assert wrapper.units[0]._full_params_buf is None
         loss.backward()
 
-        # Graph discovery pre-marks both unused units, so the shared tail and
-        # selected branch drain the entire fixed schedule during autograd.
-        assert all(unit._gradient_reduction_started for unit in wrapper.units)
+        # Only the selected branch and shared tail enter the collective
+        # schedule; globally unused units are skipped consistently.
+        assert wrapper.units[0]._gradient_reduction_started
+        assert not wrapper.units[1]._gradient_reduction_started
+        assert not wrapper.units[2]._gradient_reduction_started
+        assert wrapper.units[3]._gradient_reduction_started
         assert wrapper._next_backward_position == -1
         assert (
             len(wrapper._inflight_backward_positions)
@@ -390,6 +440,46 @@ def test_backward_hooks_launch_reduction_before_finalize(tmp_path):
             torch.testing.assert_close(actual_state[name], expected)
 
 
+def test_backward_reductions_can_be_deferred_until_finalize(tmp_path):
+    with _single_rank_mesh(tmp_path / "deferred-rendezvous") as mesh:
+        torch.manual_seed(8642)
+        model = TinyModel()
+        wrapper = FSDPWrapper(
+            model,
+            SimpleNamespace(dp_shard_size=2, device_mesh=mesh),
+            overlap_backward_reductions=False,
+            device=torch.device("cpu"),
+        )
+        wrapper.shard_model()
+
+        inputs = torch.arange(12, dtype=torch.float32).view(3, 4).div(10)
+        loss = model(inputs)["logits"].square().mean()
+        wrapper.prepare_backward(loss)
+        loss.backward()
+
+        assert all(
+            not unit._gradient_reduction_started
+            for unit in wrapper._backward_units
+        )
+        assert all(
+            unit._full_params_buf is None
+            for unit in wrapper._backward_units
+            if unit.reshard_after_forward
+        )
+        assert all(
+            any(meta.parameter.grad is not None for meta in unit.param_metas)
+            for unit in wrapper._backward_units
+        )
+
+        wrapper.finalize_backward()
+
+        assert all(
+            meta.sharded_param.grad is not None
+            for unit in wrapper._backward_units
+            for meta in unit.param_metas
+        )
+
+
 def test_partially_used_unit_reduces_after_expected_subset_accumulates(tmp_path):
     with _single_rank_mesh(tmp_path / "partial-rendezvous") as mesh:
         torch.manual_seed(9753)
@@ -399,6 +489,7 @@ def test_partially_used_unit_reduces_after_expected_subset_accumulates(tmp_path)
         wrapper = FSDPWrapper(
             model,
             SimpleNamespace(dp_shard_size=2, device_mesh=mesh),
+            find_unused_parameters=True,
             device=torch.device("cpu"),
         )
         wrapper.shard_model()
@@ -417,8 +508,18 @@ def test_partially_used_unit_reduces_after_expected_subset_accumulates(tmp_path)
         assert all(parameter.grad is None for parameter in model.parameters())
         wrapper.finalize_backward()
 
-        optimizer = torch.optim.SGD(wrapper.get_optimizer_params(), lr=0.1)
-        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+        for meta in unit.param_metas:
+            if id(meta.parameter) in expected_ids:
+                assert meta.sharded_param.grad is not None
+            else:
+                assert meta.sharded_param.grad is None
+
+        optimizer = torch.optim.SGD(
+            wrapper.get_optimizer_params(), lr=0.1, weight_decay=0.1
+        )
+        reference_optimizer = torch.optim.SGD(
+            reference.parameters(), lr=0.1, weight_decay=0.1
+        )
         reference(inputs, 0).backward()
         optimizer.step()
         reference_optimizer.step()

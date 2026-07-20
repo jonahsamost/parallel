@@ -34,6 +34,12 @@ class ParallelEngine:
             cpu_offload=cfg.engine.cpu_offload,
             activation_checkpoint=cfg.engine.activation_checkpoint,
             checkpoint_every_n=cfg.engine.checkpoint_every_n,
+            find_unused_parameters=getattr(
+                cfg.engine, "find_unused_parameters", False
+            ),
+            overlap_backward_reductions=getattr(
+                cfg.engine, "overlap_backward_reductions", True
+            ),
             device=device,
         )
         self.fsdp_wrapper.shard_model()

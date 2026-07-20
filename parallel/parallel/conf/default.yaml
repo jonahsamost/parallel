@@ -27,6 +27,8 @@ engine:
   cpu_offload: false
   activation_checkpoint: false
   checkpoint_every_n: 1
+  find_unused_parameters: false  # mainly for dense vs moe
+  overlap_backward_reductions: true 
   compile: false
 
 

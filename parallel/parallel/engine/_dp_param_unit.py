@@ -81,8 +81,9 @@ class DPParamUnit:
         self._backward_ready_notified = False
         self._gradient_reduction_started = False
         self._gradient_reduction_finished = False
-        self.defer_backward_prefetch = False
-        self._local_gradient_participated: Optional[bool] = None
+        self.managed_backward_unshard = False
+        self._backward_unshard_scheduled = False
+        self._local_gradient_participation: Optional[list[bool]] = None
         self._reduction_works: list[dist.Work] = []
         self._pending_grad_bufs: list[torch.Tensor] = []
         self._pending_shard_grads: list[torch.Tensor] = []
@@ -101,13 +102,22 @@ class DPParamUnit:
     def backward_ready(self) -> bool:
         return self._backward_ready_notified
 
-    def prepare_backward(self, used_parameter_ids: set[int]) -> bool:
-        """Select this graph's expected gradients and report an unused unit."""
+    def prepare_backward(self, used_parameter_ids: Optional[set[int]]) -> bool:
+        """Select locally expected gradients and report an unused unit.
+
+        ``None`` is the fast-path contract: every parameter in this unit is
+        expected to participate. A concrete set comes from autograd-graph
+        discovery and may contain only a subset of the unit's parameters.
+        """
         if self._gradient_reduction_started:
             raise RuntimeError(
                 f"Cannot prepare FSDP unit {self.unit_index} during gradient reduction"
             )
-        self._expected_grad_param_ids = self.parameter_ids.intersection(used_parameter_ids)
+        self._expected_grad_param_ids = (
+            self.parameter_ids
+            if used_parameter_ids is None
+            else self.parameter_ids.intersection(used_parameter_ids)
+        )
         self._post_accumulated_param_ids.clear()
         self._backward_ready_notified = not self._expected_grad_param_ids
         return self._backward_ready_notified
@@ -281,9 +291,9 @@ class DPParamUnit:
                 f"Gradient reduction already started for FSDP unit {self.unit_index}"
             )
 
-        self._local_gradient_participated = any(
+        self._local_gradient_participation = [
             meta.parameter.grad is not None for meta in self.param_metas
-        )
+        ]
         self._reduction_works.clear()
         self._pending_grad_bufs.clear()
         self._pending_shard_grads.clear()
@@ -319,7 +329,7 @@ class DPParamUnit:
         if not self._gradient_reduction_started or self._gradient_reduction_finished:
             return
         if (
-            self._local_gradient_participated is None
+            self._local_gradient_participation is None
             or len(self._reduction_works) != len(self.param_metas)
             or len(self._pending_shard_grads) != len(self.param_metas)
         ):
@@ -339,13 +349,24 @@ class DPParamUnit:
 
     def accumulate_reduced_gradient(self, accumulate: bool) -> None:
         """Attach reduced DTensor gradients to persistent sharded parameters."""
+        self.accumulate_reduced_gradients([accumulate] * len(self.param_metas))
+
+    def accumulate_reduced_gradients(self, accumulate: Sequence[bool]) -> None:
+        """Attach selected reduced gradients to persistent DTensor parameters."""
         self.finish_gradient_reduction()
         if len(self._pending_shard_grads) != len(self.param_metas):
             raise RuntimeError(
                 f"Missing reduced gradients for FSDP unit {self.unit_index}"
             )
-        if accumulate:
-            for meta, padded_grad in zip(self.param_metas, self._pending_shard_grads):
+        if len(accumulate) != len(self.param_metas):
+            raise RuntimeError(
+                f"Expected {len(self.param_metas)} participation values for FSDP "
+                f"unit {self.unit_index}, got {len(accumulate)}"
+            )
+        for should_accumulate, meta, padded_grad in zip(
+            accumulate, self.param_metas, self._pending_shard_grads
+        ):
+            if should_accumulate:
                 if meta.sharded_param is None:
                     raise RuntimeError(f"Parameter {meta.name} has no sharded state")
                 local_grad = padded_grad.narrow(0, 0, meta.local_rows)
@@ -362,7 +383,7 @@ class DPParamUnit:
                 else:
                     meta.sharded_param.grad._local_tensor.add_(local_grad)
 
-        self._local_gradient_participated = None
+        self._local_gradient_participation = None
         self._pending_shard_grads.clear()
 
     def reset_backward_state(self) -> None:
@@ -376,14 +397,20 @@ class DPParamUnit:
         self._backward_ready_notified = False
         self._gradient_reduction_started = False
         self._gradient_reduction_finished = False
+        self.managed_backward_unshard = False
+        self._backward_unshard_scheduled = False
 
     @property
     def local_gradient_participated(self) -> bool:
-        if self._local_gradient_participated is None:
+        return any(self.local_gradient_participation)
+
+    @property
+    def local_gradient_participation(self) -> list[bool]:
+        if self._local_gradient_participation is None:
             raise RuntimeError(
                 f"Gradient reduction has not started for FSDP unit {self.unit_index}"
             )
-        return self._local_gradient_participated
+        return self._local_gradient_participation
 
     def set_backward_ready_callback(
         self, callback: Callable[[DPParamUnit], None]
@@ -391,6 +418,26 @@ class DPParamUnit:
         self._backward_ready_callback = callback
 
     # Prefetching
+
+    def schedule_backward_unshard(self) -> None:
+        """Collectively unshard this unit at its wrapper-assigned position."""
+        if self._backward_unshard_scheduled:
+            return
+        self._backward_unshard_scheduled = True
+        self.prefetch()
+
+    def wait_for_backward_unshard(self) -> None:
+        """Wait until the wrapper-scheduled full parameters are consumable."""
+        if not self._backward_unshard_scheduled:
+            raise RuntimeError(
+                f"FSDP unit {self.unit_index} reached backward before its globally "
+                "ordered parameter all-gather was scheduled"
+            )
+        self.wait_for_prefetch()
+        if self._full_params_buf is None:
+            raise RuntimeError(
+                f"FSDP unit {self.unit_index} has no full parameters for backward"
+            )
 
     def prefetch(self) -> None:
         """
@@ -466,9 +513,11 @@ class DPParamUnit:
 
     def _pre_bwd_hook(self, module, grad_output):
         self._is_in_backward = True
-        self.wait_for_prefetch()
-        self.all_gather()
-        if not self.defer_backward_prefetch:
+        if self.managed_backward_unshard:
+            self.wait_for_backward_unshard()
+        else:
+            self.wait_for_prefetch()
+            self.all_gather()
             self._prefetch_next_backward()
 
     def _post_bwd_hook(self, module, grad_input, grad_output):
