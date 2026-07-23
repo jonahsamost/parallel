@@ -1,154 +1,206 @@
-### Roadmap
-- DP / FSDP / TP / EP / PP / CP axes
-- activation checkpointing
-- comms axes (i.e. DeepEP)
+# parallel
 
-### Running
+`parallel` is a small, pedagogical, explicit distributed-training engine for studying how
+PyTorch model parallelism, expert parallelism, sequence parallelism, and fully
+sharded data parallelism fit together.
 
-Launch replicated data parallel training with:
+The main supported model families are dense Qwen3 and Qwen3-MoE. The engine
+implements:
 
-```bash
-torchrun --nproc-per-node=8 -m parallel.parallel.train parallel.dp_replicate=8
-```
+- Replicated data parallelism (`DP replicate`).
+- Fully sharded data parallelism (`FSDP` / `DP shard`).
+- Tensor parallel attention, MLPs, embeddings, and LM heads (`TP`).
+- Sequence-parallel decoder activations (`SP`).
+- Expert ownership and variable-size token all-to-all (`EP`).
+- Vocabulary-parallel cross entropy.
+- MoE router auxiliary loss.
+- Distributed gradient norm and clipping.
+- Portable full-model and exact-topology training checkpoints.
+- Aggregate collective profiling and PyTorch timeline traces.
 
-Launch fully sharded data parallel training with:
+The implementation deliberately keeps the distributed operations visible. It
+is intended as both a training system and a place to understand the mechanics
+of composable parallelism.
 
-```bash
-torchrun --nproc-per-node=8 -m parallel.parallel.train parallel.dp_shard=8
-```
+## Setup
 
-With no model-parallel axis enabled, the product of `parallel.dp_replicate` and
-`parallel.dp_shard` must equal the distributed world size.
-
-Dense Qwen3 models support tensor parallelism:
-
-```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train parallel.tp=4
-```
-
-Qwen3-MoE models use a folded model-parallel group: the same ranks shard
-attention heads with tensor parallelism and experts with expert parallelism:
+## Download the training data
 
 ```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train \
-  parallel.tp=4 parallel.ep=4 parallel.expert_tp=1
+uv run python -m parallel.parallel.dataset -n 50 -w 24
 ```
 
-Folded MoE requires `tp == ep`, and expert tensor parallelism currently requires
-`expert_tp == 1`. Attention heads, key/value heads, sharded MLP dimensions,
-experts, and vocabulary size must be divisible by their parallel dimension.
-Parameters are initialized on meta and only each rank's local model-parallel
-checkpoint shards are materialized.
+## Parallel topology
 
-Tensor/expert parallelism composes with the custom FSDP implementation. For
-example, four ranks can form two-rank folded TP/EP groups and independently
-shard each local model-parallel parameter over a two-rank DP-shard group:
+The currently supported physical world size is:
+
+```text
+world_size = dp_replicate × dp_shard × tp
+```
+
+`EP` and `SP` are folded onto the TP ranks and therefore do not multiply the
+world size:
+
+```text
+MoE:    ep == tp
+SP:     sp == 1 or sp == tp
+ETP:    expert_tp == 1
+```
+
+For example:
+
+```text
+4 GPUs
+├── TP = EP = SP = 2
+└── DP shard = 2
+```
+
+Each pair of model-parallel ranks owns one TP/EP/SP model replica. The
+corresponding parameters of that model-parallel replica are then sharded over
+a two-rank FSDP group.
+
+### What each axis does
+
+- `parallel.dp_replicate`: replicas hold the same parameters and average
+  gradients.
+- `parallel.dp_shard`: FSDP shards parameters, gradients, and optimizer state;
+  parameters are all-gathered by transformer unit for computation.
+- `parallel.tp`: shards attention heads, MLP dimensions, embeddings, and the
+  vocabulary projection over one model-parallel group.
+- `parallel.sp`: keeps residual activations token-sharded between transformer
+  operations. Attention/MLP inputs are gathered when required and row-parallel
+  outputs are reduce-scattered.
+- `parallel.ep`: assigns experts to the folded TP/EP ranks and dispatches routed
+  tokens using variable-size all-to-all.
+- `parallel.expert_tp`: reserved for tensor parallelism within an individual
+  expert. It currently must be `1`.
+
+Attention heads, key/value heads, sharded MLP dimensions, experts, and
+vocabulary dimensions must be divisible by their relevant parallel sizes.
+
+## Training
+
+Commands below use offline W&B logging by default. Only rank zero creates a
+run.
+
+### Two-GPU FSDP
+
+This keeps model parallelism disabled and shards the complete model over two
+GPUs:
 
 ```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train \
-  parallel.tp=2 parallel.ep=2 parallel.expert_tp=1 \
-  parallel.dp_shard=2
+CUDA_VISIBLE_DEVICES=0,1 \
+WANDB_MODE=offline \
+WANDB_API_KEY=offline \
+uv run torchrun --standalone --nproc-per-node=2 \
+  -m parallel.parallel.train \
+  model.name=Qwen/Qwen3-0.6B \
+  parallel.dp_replicate=1 \
+  parallel.dp_shard=2 \
+  parallel.tp=1 \
+  parallel.sp=1 \
+  parallel.ep=1 \
+  model.per_device_batch_size=1 \
+  model.max_seq_length=512 \
+  config.grad_accum_steps=1 \
+  engine.activation_checkpoint=true
 ```
 
-The physical world size is `dp_replicate * tp * dp_shard` (`ep` reuses the TP
-axis). Portable full-model checkpoints reconstruct both shard axes, while
-exact-topology training checkpoints retain TP and DP-shard ownership plus
-optimizer and resume state.
+### Two-GPU dense TP
 
-Sequence parallelism reuses the TP axis as well. Set `sp=tp` to keep decoder
-residuals sharded over tokens, use reduce-scatter attention/MLP outputs, and
-dispatch MoE tokens to expert owners with variable-size all-to-all:
+Dense Qwen3 uses TP without EP:
 
 ```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train \
-  parallel.tp=2 parallel.sp=2 parallel.ep=2 \
-  parallel.dp_shard=2
+CUDA_VISIBLE_DEVICES=0,1 \
+WANDB_MODE=offline \
+WANDB_API_KEY=offline \
+uv run torchrun --standalone --nproc-per-node=2 \
+  -m parallel.parallel.train \
+  model.name=Qwen/Qwen3-0.6B \
+  parallel.dp_replicate=1 \
+  parallel.dp_shard=1 \
+  parallel.tp=2 \
+  parallel.sp=1 \
+  parallel.ep=1 \
+  model.per_device_batch_size=1 \
+  model.max_seq_length=512
 ```
 
-`sp` must be either `1` or equal to `tp`; it does not multiply the physical
-world size. Expert tensor parallelism and model-parallel `torch.compile`
-remain follow-up work.
-
-The custom FSDP implementation supports static module graphs, gradient
-accumulation, separately sharded trainable and frozen parameters, mixed
-BF16/FP32 parameter groups, CPU shard offload, activation checkpointing, and
-full model state dictionaries. `torch.compile` is currently supported only
-when `parallel.dp_shard=1`.
-
-### GPU integration tests
-
-The ordinary test suite uses CPU/Gloo. On a node with four visible CUDA GPUs,
-run the opt-in NCCL suite with:
+Enable sequence parallelism on the same two TP ranks with:
 
 ```bash
-uv run pytest -q -m gpu tests/gpu
+parallel.sp=2
 ```
 
-The suite covers two-GPU FSDP, dense TP, TP+SP, folded TP/EP, folded TP+SP+EP,
-and four-GPU model parallelism composed with FSDP. The composed tests run with
-both overlapped and deferred backward reductions and validate BF16
-forward/backward parity, auxiliary router loss, gradient norms, optimizer
-steps, portable checkpoints, exact-topology resume, and a post-resume step.
+SP does not require two additional ranks.
 
-### Profiling
+### Four-GPU Qwen3-MoE with TP + SP + EP + FSDP
 
-`profile` can time either a block or a decorated function:
-
-```python
-from parallel.parallel import profile
-
-with profile("shard_to_device", synchronize=True, device=device):
-    shard_on_device = shard_on_device.to(device, non_blocking=True)
-
-@profile("forward")
-def forward(inputs):
-    return model(inputs)
-
-with profile("all_gather", device=device, use_cuda_events=True):
-    dist.all_gather_into_tensor(full_buf, shard, group=group)
-
-with profile("training_step", device=device, use_torch_profiler=True):
-    loss = model(inputs).loss
-    loss.backward()
-```
-
-Timings are logged in milliseconds through the rank-aware project logger. Use
-`engine.collective_profiling=true` to record deferred CUDA events around FSDP,
-TP, SP, and EP collectives and emit one cross-rank aggregate per operation and
-phase after each training step:
+This is the primary composed configuration used during development:
 
 ```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train \
-  parallel.tp=2 parallel.sp=2 parallel.ep=2 parallel.dp_shard=2 \
-  engine.collective_profiling=true
+set -o pipefail
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+WANDB_MODE=offline \
+WANDB_API_KEY=offline \
+uv run torchrun --standalone --nproc-per-node=4 \
+  -m parallel.parallel.train \
+  parallel.dp_replicate=1 \
+  parallel.dp_shard=2 \
+  parallel.tp=2 \
+  parallel.sp=2 \
+  parallel.ep=2 \
+  parallel.expert_tp=1 \
+  model.per_device_batch_size=1 \
+  model.max_seq_length=512 \
+  config.grad_accum_steps=1 \
+  config.max_steps=15 \
+  config.eval_interval=100 \
+  config.eval_steps=10 \
+  config.checkpoint_interval=0 \
+  engine.activation_checkpoint=true \
+  engine.checkpoint_every_n=1 \
+  engine.overlap_backward_reductions=true \
+  engine.collective_profiling=false \
+  engine.torch_profiler=false \
+  2>&1 | tee /tmp/qwen3-training.log
 ```
 
-The summary includes calls and payload per rank, CUDA p50/p95/max timing, and
-the rank/unit/parameter responsible for the slowest event. CUDA events are
-resolved once at step end so per-collective synchronization does not destroy
-communication overlap.
+## Project layout
 
-For a timeline trace, the scheduled PyTorch profiler can warm up on the first
-step and capture only the second:
-
-```bash
-torchrun --nproc-per-node=4 -m parallel.parallel.train \
-  parallel.tp=2 parallel.sp=2 parallel.ep=2 parallel.dp_shard=2 \
-  config.max_steps=2 engine.collective_profiling=true \
-  engine.torch_profiler=true \
-  engine.torch_profiler_trace_dir=/tmp/qwen3-profile
+```text
+parallel/parallel/
+├── train.py                         training loop
+├── dataset.py                       dataset shard downloader/reader
+├── state.py                         topology and process-group state
+├── profiling.py                     aggregate and timeline profiling
+└── engine/
+    ├── engine.py                    forward/backward/optimizer orchestration
+    ├── dp_sharded.py                FSDP wrapper and reduction schedule
+    ├── _dp_param_unit.py            flat FSDP parameter/gradient units
+    ├── checkpoint.py                training checkpoint manager
+    └── model_parallel/
+        ├── api.py                   model-parallel orchestration
+        ├── plan.py                  model-independent placement plan
+        ├── registry.py              model-family plan registry
+        ├── tensor_parallel.py       TP operations
+        ├── sequence_parallel.py     token-sharded residual layouts
+        ├── expert_parallel.py       expert ownership
+        ├── token_dispatch.py        variable-size EP all-to-all
+        ├── loss_parallel.py         vocabulary-parallel loss
+        ├── grad_norm.py             distributed gradient norm
+        └── models/                  Qwen3/Qwen3-MoE plan builders
 ```
 
-This writes one compressed trace per rank. The default schedule uses one warmup
-step and one active step; adjust `engine.torch_profiler_warmup_steps` and
-`engine.torch_profiler_active_steps` for longer investigations.
+## Current constraints
 
-Use `synchronize=True` for accurate CUDA timings; it deliberately prevents CUDA
-work from overlapping across the measured boundary. CUDA events measure work
-on the current CUDA stream and wait for the end event when the block exits. The
-PyTorch profiler logs its ten most expensive operators and is best enabled only
-for a small number of iterations.
-
-### Would be cool
-- quantization aware training
-- 8bit and [4bit](https://github.com/sgl-project/sglang/pull/26083)
+- TP plans currently target Qwen3 and Qwen3-MoE.
+- MoE uses folded `tp == ep`.
+- Sequence parallelism is disabled or folded as `sp == tp`.
+- Expert tensor parallelism currently requires `expert_tp == 1`.
+- Pipeline and context-parallel axes are reserved but not implemented.
+- `torch.compile` is not supported with the custom FSDP or folded
+  model-parallel implementation.
+- Multi-node untested
