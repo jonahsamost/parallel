@@ -54,6 +54,7 @@ class ModelParallelPlan:
     tensor_parallel_size: int
     expert_parallel_size: int
     expert_tensor_parallel_size: int
+    sequence_parallel_size: int
     module_rules: tuple[ModuleRule, ...]
     parameter_placements: tuple[ParameterPlacement, ...]
     capabilities: ModelParallelCapabilities = field(
@@ -110,6 +111,7 @@ class ModelParallelPlan:
             "tensor_parallel_size": self.tensor_parallel_size,
             "expert_parallel_size": self.expert_parallel_size,
             "expert_tensor_parallel_size": self.expert_tensor_parallel_size,
+            "sequence_parallel_size": self.sequence_parallel_size,
             "parameters": [
                 {
                     "pattern": placement.pattern,
@@ -123,6 +125,10 @@ class ModelParallelPlan:
         }
 
     def validate_runtime(self, pconfig) -> None:
+        if self.sequence_parallel_size not in (1, self.tensor_parallel_size):
+            raise ValueError(
+                "Sequence parallelism must be disabled or reuse the complete TP group"
+            )
         if pconfig.dp_shard_size > 1 and not self.capabilities.fsdp_composition:
             raise NotImplementedError(
                 f"{self.model_type} model parallelism does not yet compose with "

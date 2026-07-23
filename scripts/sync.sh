@@ -3,8 +3,8 @@
 # --- CONFIGURATION ---
 POD_IP="$1"
 POD_PORT="$2"
-LOCAL_DIR=/Users/jonah/gpu/parallel/scripts
-REMOTE_DIR="root@${POD_IP}:/root/"
+LOCAL_DIR=~/gpu/parallel/
+REMOTE_DIR="root@${POD_IP}:/root/parallel"
 KEY_PATH="~/.ssh/id_ed25519"
 # ---------------------
 

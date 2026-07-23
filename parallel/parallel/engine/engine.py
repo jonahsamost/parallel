@@ -60,6 +60,7 @@ class ParallelEngine:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.checkpoint = CheckpointManager(self)
+        self.reset_step_memory_stats()
 
     def _sync_initial_state(self):
         """ Ensure each dp replica starts from identical model state """
@@ -87,8 +88,40 @@ class ParallelEngine:
     @property
     def lr(self):
         return self.optimizer.param_groups[0]['lr']
+
+    def reset_step_memory_stats(self):
+        """Reset the forward/backward peaks accumulated across microbatches."""
+        self._forward_peak_memory_allocated = 0
+        self._backward_peak_memory_allocated = 0
+
+    def _reset_cuda_peak_memory(self):
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _cuda_peak_memory_allocated(self) -> int:
+        if self.device.type != "cuda":
+            return 0
+        return torch.cuda.max_memory_allocated(self.device)
+
+    def step_memory_stats(self) -> dict[str, int]:
+        """Return the maximum per-phase allocated bytes across all ranks."""
+        peaks = torch.tensor(
+            [
+                self._forward_peak_memory_allocated,
+                self._backward_peak_memory_allocated,
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
+        return {
+            "forward_peak_allocated_bytes": int(peaks[0].item()),
+            "backward_peak_allocated_bytes": int(peaks[1].item()),
+        }
     
     def forward(self, x, y):
+        self._reset_cuda_peak_memory()
         self.sync_buffers()
         with torch.autocast(device_type=self.pconfig.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
             if self.mp_wrapper.is_active:
@@ -96,6 +129,10 @@ class ParallelEngine:
                 outputs.loss = self.mp_wrapper.training_loss(outputs, y)
             else:
                 outputs = self.model(input_ids=x, labels=y)
+        self._forward_peak_memory_allocated = max(
+            self._forward_peak_memory_allocated,
+            self._cuda_peak_memory_allocated(),
+        )
         return outputs
 
     def sync_buffers(self):
@@ -111,6 +148,7 @@ class ParallelEngine:
                 dist.broadcast(buffer, src=source_rank, group=group)
     
     def backward(self, loss):
+        self._reset_cuda_peak_memory()
         self.fsdp_wrapper.prepare_backward(loss)
         with self.mp_wrapper.backward_context():
             if self.grad_scaler.is_enabled():
@@ -118,6 +156,10 @@ class ParallelEngine:
             else:
                 loss.backward()
         self.fsdp_wrapper.finalize_backward()
+        self._backward_peak_memory_allocated = max(
+            self._backward_peak_memory_allocated,
+            self._cuda_peak_memory_allocated(),
+        )
     
     def step(self):
         # The normal sequence is:

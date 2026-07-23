@@ -12,7 +12,44 @@ from torch.distributed.tensor import DTensor, Shard
 
 from parallel.parallel.engine.dp_sharded import FSDPWrapper
 from parallel.parallel.engine.engine import ParallelEngine
-from parallel.parallel.engine._dp_param_unit import DPParamUnit
+from parallel.parallel.engine._dp_param_unit import (
+    DPParamUnit,
+    _all_gather_contiguous,
+    _reduce_scatter_contiguous,
+)
+
+
+def test_contiguous_collectives_fall_back_to_pytorch_211_names(monkeypatch):
+    gathered = object()
+    reduced = object()
+    all_gather = Mock(return_value=gathered)
+    reduce_scatter = Mock(return_value=reduced)
+    monkeypatch.setattr(dist, "all_gather_single", None, raising=False)
+    monkeypatch.setattr(dist, "reduce_scatter_single", None, raising=False)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", all_gather)
+    monkeypatch.setattr(dist, "reduce_scatter_tensor", reduce_scatter)
+
+    output = torch.empty(2)
+    input = torch.ones(1)
+    assert _all_gather_contiguous(output, input, group="group") is gathered
+    assert (
+        _reduce_scatter_contiguous(
+            output,
+            input,
+            op=dist.ReduceOp.SUM,
+            group="group",
+            async_op=True,
+        )
+        is reduced
+    )
+    all_gather.assert_called_once_with(output, input, group="group")
+    reduce_scatter.assert_called_once_with(
+        output,
+        input,
+        op=dist.ReduceOp.SUM,
+        group="group",
+        async_op=True,
+    )
 
 
 class TinyModel(nn.Module):

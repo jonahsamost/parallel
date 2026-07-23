@@ -71,6 +71,28 @@ def test_parallel_config_folds_equal_tensor_and_expert_parallel_sizes(monkeypatc
     )
 
 
+def test_sequence_parallel_reuses_tensor_parallel_mesh(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    config = ParallelConfig(_config(tp=4, sp=4, ep=4, dp_shard=2))
+
+    assert config.total_size == 8
+    assert Strategies.SP not in config.get_mesh_layout()[0]
+
+
+def test_sequence_parallel_must_equal_tensor_parallel_size(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_rank", lambda: 0)
+    monkeypatch.setattr("parallel.parallel.state.dist.get_world_size", lambda: 8)
+
+    with pytest.raises(ValueError, match="sp == 1 or sp == tp"):
+        ParallelConfig(_config(tp=4, sp=2, ep=4, dp_shard=2))
+
+
 def test_parallel_config_rejects_unfolded_tensor_and_expert_sizes(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setattr("parallel.parallel.state.is_dist_initialized", lambda: True)

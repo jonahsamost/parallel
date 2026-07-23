@@ -57,6 +57,31 @@ def test_profile_rejects_empty_name():
         profile("")
 
 
+def test_profile_can_be_disabled_for_context_and_decorator(monkeypatch):
+    logger = Mock(spec=logging.Logger)
+    timer = Mock()
+    monkeypatch.setattr(profiling, "perf_counter", timer)
+
+    with profile(
+        "disabled context",
+        logger=logger,
+        enabled=False,
+        synchronize=True,
+        device="cuda:0",
+        use_cuda_events=True,
+        use_torch_profiler=True,
+    ):
+        pass
+
+    @profile("disabled decorator", logger=logger, enabled=False)
+    def add(left, right):
+        return left + right
+
+    assert add(2, 3) == 5
+    timer.assert_not_called()
+    logger.log.assert_not_called()
+
+
 def test_profile_uses_cuda_events(monkeypatch):
     logger = Mock(spec=logging.Logger)
     start_event = Mock()

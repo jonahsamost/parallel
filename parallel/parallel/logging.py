@@ -5,6 +5,17 @@ import logging
 from .collectives import wait_for_everyone
 from .state import RuntimeState
 
+
+def configure_logging(log_level: str | None = None):
+    """Configure application logging, defaulting training output to INFO."""
+    level = log_level or os.environ.get("PARALLEL_LOG_LEVEL", "INFO")
+    logging.basicConfig(
+        level=level.upper(),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        force=True,
+    )
+
+
 class MultiProcAdapter(logging.LoggerAdapter):
     
     def process(self, msg, kwargs):

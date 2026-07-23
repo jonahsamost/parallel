@@ -6,11 +6,16 @@ from .checkpoint import ComposedModelParallelCheckpoint, ModelParallelCheckpoint
 from .expert_parallel import (
     ExpertPartition,
     ReplicatedTokenExpertParallel,
+    SequenceParallelExpertParallel,
     verify_expert_modules,
 )
 from .grad_norm import clip_grad_norm_
 from .loss_parallel import loss_parallel_context, vocab_parallel_cross_entropy
 from .registry import build_model_parallel_plan
+from .sequence_parallel import (
+    SequenceParallelRuntime,
+    sequence_parallel_load_balancing_loss,
+)
 from .tensor_parallel import (
     install_tensor_parallel_gradient_hooks,
     tensor_parallel_mesh,
@@ -30,6 +35,7 @@ class ModelParallelWrapper:
         self.group = None
         self.experts = None
         self.expert_runtime = None
+        self.sequence_runtime = None
         self.checkpoint = None
         self._tp_gradient_hook_handles = []
 
@@ -45,6 +51,13 @@ class ModelParallelWrapper:
             model, self.plan, self.mesh
         )
 
+        if self.plan.capabilities.sequence_parallel:
+            self.sequence_runtime = SequenceParallelRuntime(
+                self.group,
+                dense_mlp=not self.plan.capabilities.expert_parallel,
+            )
+            self.sequence_runtime.apply(model)
+
         if self.plan.capabilities.expert_parallel:
             self.experts = ExpertPartition(
                 model.config.num_experts,
@@ -52,9 +65,12 @@ class ModelParallelWrapper:
                 self.mesh.get_local_rank(),
             )
             verify_expert_modules(model, self.experts)
-            self.expert_runtime = ReplicatedTokenExpertParallel(
-                self.experts, self.group
+            runtime_type = (
+                SequenceParallelExpertParallel
+                if self.plan.capabilities.sequence_parallel
+                else ReplicatedTokenExpertParallel
             )
+            self.expert_runtime = runtime_type(self.experts, self.group)
             self.expert_runtime.apply(model)
         self.checkpoint = ModelParallelCheckpoint(
             model, pconfig, self.plan, self.mesh, device
@@ -85,6 +101,18 @@ class ModelParallelWrapper:
     def training_loss(self, outputs, labels):
         loss = self.token_loss(outputs.logits, labels)
         aux_loss = getattr(outputs, "aux_loss", None)
+        if (
+            self.is_active
+            and self.plan.capabilities.sequence_parallel
+            and self.plan.capabilities.expert_parallel
+        ):
+            aux_loss = sequence_parallel_load_balancing_loss(
+                getattr(outputs, "router_logits", None),
+                num_experts=self.model.config.num_experts,
+                top_k=self.model.config.num_experts_per_tok,
+                group=self.group,
+            )
+            outputs.aux_loss = aux_loss
         if aux_loss is not None:
             loss = loss + self.model.router_aux_loss_coef * aux_loss.to(loss.device)
         return loss

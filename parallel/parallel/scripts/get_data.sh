@@ -1,0 +1,1 @@
+uv run python -m parallel.parallel.dataset -n 50 -w 24

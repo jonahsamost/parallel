@@ -39,13 +39,30 @@ def qwen_attention_placements() -> tuple[ParameterPlacement, ...]:
     )
 
 
-def qwen_replicated_placements() -> tuple[ParameterPlacement, ...]:
+def qwen_replicated_placements(
+    sequence_parallel: bool = False,
+) -> tuple[ParameterPlacement, ...]:
     P = ParameterParallelism
+    reduction = (
+        GradientReduction.SUM_TP
+        if sequence_parallel
+        else GradientReduction.NONE
+    )
     return (
-        ParameterPlacement("model.layers.*.input_layernorm.weight", P.REPLICATED),
         ParameterPlacement(
-            "model.layers.*.post_attention_layernorm.weight", P.REPLICATED
+            "model.layers.*.input_layernorm.weight",
+            P.REPLICATED,
+            gradient_reduction=reduction,
         ),
-        ParameterPlacement("model.norm.weight", P.REPLICATED),
+        ParameterPlacement(
+            "model.layers.*.post_attention_layernorm.weight",
+            P.REPLICATED,
+            gradient_reduction=reduction,
+        ),
+        ParameterPlacement(
+            "model.norm.weight",
+            P.REPLICATED,
+            gradient_reduction=reduction,
+        ),
         # Rotary embedding buffers do not appear in named_parameters.
     )

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from .token_dispatch import TokenDispatcher
+
 
 @dataclass(frozen=True)
 class ExpertPartition:
@@ -116,6 +118,10 @@ class ReplicatedTokenExpertParallel:
 
     def _router_output_hook(self, module, inputs, outputs):
         router_logits, scores, global_indices, *extra = outputs
+        # The locality mask must run before the backward all-reduce. Otherwise
+        # each rank masks the already-reduced gradient a second time and the
+        # replicated router receives only its locally owned expert routes.
+        scores = _AllReduceBackward.apply(scores, self.group)
         local_indices, local_scores, _ = self.partition.localize_routes(
             global_indices, scores
         )
@@ -126,7 +132,7 @@ class ReplicatedTokenExpertParallel:
         return (
             _AllReduceBackward.apply(hidden_states, self.group),
             local_indices,
-            _AllReduceBackward.apply(routing_weights, self.group),
+            routing_weights,
         )
 
     def _experts_output_hook(self, module, inputs, output):
@@ -161,3 +167,52 @@ class ReplicatedTokenExpertParallel:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+
+
+class SequenceParallelExpertParallel:
+    """Route local SP tokens to expert owners with a reversible all-to-all."""
+
+    def __init__(self, partition: ExpertPartition, group):
+        self.partition = partition
+        self.group = group
+        self.dispatcher = TokenDispatcher(partition, group)
+        self._handles = []
+        self._states = {}
+
+    def _experts_input_hook(self, module, inputs):
+        hidden_states, global_indices, routing_weights = inputs
+        hidden, indices, weights, state = self.dispatcher.dispatch(
+            hidden_states, global_indices, routing_weights
+        )
+        self._states.setdefault(id(module), []).append(state)
+        return hidden, indices, weights
+
+    def _experts_output_hook(self, module, inputs, output):
+        states = self._states.get(id(module))
+        if not states:
+            raise RuntimeError("Expert output has no matching token dispatch")
+        return self.dispatcher.combine(output, states.pop())
+
+    def apply(self, model) -> None:
+        if self._handles:
+            raise RuntimeError("Expert parallel hooks are already installed")
+        experts = [
+            module
+            for name, module in model.named_modules()
+            if name.endswith(".mlp.experts")
+        ]
+        if not experts:
+            raise RuntimeError("Sequence-parallel EP found no expert modules")
+        for module in experts:
+            self._handles.append(
+                module.register_forward_pre_hook(self._experts_input_hook)
+            )
+            self._handles.append(
+                module.register_forward_hook(self._experts_output_hook)
+            )
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._states.clear()

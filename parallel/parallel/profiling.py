@@ -18,6 +18,7 @@ class _Profile(ContextDecorator):
         *,
         logger: logging.Logger | logging.LoggerAdapter,
         level: int,
+        enabled: bool,
         synchronize: bool,
         device: Any,
         use_torch_profiler: bool,
@@ -28,6 +29,7 @@ class _Profile(ContextDecorator):
         self.name = name
         self.logger = logger
         self.level = level
+        self.enabled = enabled
         self.synchronize = synchronize
         self.device = device
         self.use_torch_profiler = use_torch_profiler
@@ -46,6 +48,7 @@ class _Profile(ContextDecorator):
             self.name,
             logger=self.logger,
             level=self.level,
+            enabled=self.enabled,
             synchronize=self.synchronize,
             device=self.device,
             use_torch_profiler=self.use_torch_profiler,
@@ -104,6 +107,8 @@ class _Profile(ContextDecorator):
             raise RuntimeError("use_cuda_events requires CUDA to be available")
 
     def __enter__(self) -> _Profile:
+        if not self.enabled:
+            return self
         self._synchronize_cuda()
         if self.use_torch_profiler or self.use_cuda_events:
             import torch
@@ -115,6 +120,8 @@ class _Profile(ContextDecorator):
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
+        if not self.enabled:
+            return False
         if self._cuda_end is not None:
             import torch
 
@@ -162,12 +169,16 @@ def profile(
     *,
     logger: logging.Logger | logging.LoggerAdapter | None = None,
     level: int = logging.INFO,
+    enabled: bool = True,
     synchronize: bool = False,
     device: Any = None,
     use_torch_profiler: bool = False,
     use_cuda_events: bool = False,
 ) -> _Profile:
     """Time a block or decorated function and log its duration.
+
+    Set ``enabled=False`` to make the context manager or decorator a no-op
+    without changing the profiled code.
 
     Set ``synchronize=True`` when measuring asynchronous CUDA work. This waits
     for the device before and after the operation, giving an accurate duration
@@ -183,6 +194,7 @@ def profile(
         name,
         logger=logger if logger is not None else _DEFAULT_LOGGER,
         level=level,
+        enabled=enabled,
         synchronize=synchronize,
         device=device,
         use_torch_profiler=use_torch_profiler,

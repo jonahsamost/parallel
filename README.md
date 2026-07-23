@@ -53,14 +53,42 @@ torchrun --nproc-per-node=4 -m parallel.parallel.train \
 The physical world size is `dp_replicate * tp * dp_shard` (`ep` reuses the TP
 axis). Portable full-model checkpoints reconstruct both shard axes, while
 exact-topology training checkpoints retain TP and DP-shard ownership plus
-optimizer and resume state. Sequence parallelism, expert tensor parallelism,
-and model-parallel `torch.compile` remain follow-up work.
+optimizer and resume state.
+
+Sequence parallelism reuses the TP axis as well. Set `sp=tp` to keep decoder
+residuals sharded over tokens, use reduce-scatter attention/MLP outputs, and
+dispatch MoE tokens to expert owners with variable-size all-to-all:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train \
+  parallel.tp=2 parallel.sp=2 parallel.ep=2 \
+  parallel.dp_shard=2
+```
+
+`sp` must be either `1` or equal to `tp`; it does not multiply the physical
+world size. Expert tensor parallelism and model-parallel `torch.compile`
+remain follow-up work.
 
 The custom FSDP implementation supports static module graphs, gradient
 accumulation, separately sharded trainable and frozen parameters, mixed
 BF16/FP32 parameter groups, CPU shard offload, activation checkpointing, and
 full model state dictionaries. `torch.compile` is currently supported only
 when `parallel.dp_shard=1`.
+
+### GPU integration tests
+
+The ordinary test suite uses CPU/Gloo. On a node with four visible CUDA GPUs,
+run the opt-in NCCL suite with:
+
+```bash
+uv run pytest -q -m gpu tests/gpu
+```
+
+The suite covers two-GPU FSDP, dense TP, TP+SP, folded TP/EP, folded TP+SP+EP,
+and four-GPU model parallelism composed with FSDP. The composed tests run with
+both overlapped and deferred backward reductions and validate BF16
+forward/backward parity, auxiliary router loss, gradient norms, optimizer
+steps, portable checkpoints, exact-topology resume, and a post-resume step.
 
 ### Profiling
 

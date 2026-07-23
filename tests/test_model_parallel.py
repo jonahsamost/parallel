@@ -46,11 +46,12 @@ def _tiny_qwen_config(**overrides):
     return Qwen3MoeConfig(**values)
 
 
-def _pconfig(mesh=None, size=2):
+def _pconfig(mesh=None, size=2, *, sequence_parallel=False):
     return SimpleNamespace(
         tp_size=size,
         ep_size=size,
         expert_tp_size=1,
+        sp_size=size if sequence_parallel else 1,
         dp_shard_size=1,
         model_parallel_enabled=size > 1,
         device_mesh=mesh,
@@ -60,17 +61,18 @@ def _pconfig(mesh=None, size=2):
     )
 
 
-def _dense_pconfig(mesh=None, size=2):
-    config = _pconfig(mesh, size)
+def _dense_pconfig(mesh=None, size=2, *, sequence_parallel=False):
+    config = _pconfig(mesh, size, sequence_parallel=sequence_parallel)
     config.ep_size = 1
     return config
 
 
-def _composed_pconfig(mesh):
+def _composed_pconfig(mesh, *, sequence_parallel=False):
     return SimpleNamespace(
         tp_size=2,
         ep_size=2,
         expert_tp_size=1,
+        sp_size=2 if sequence_parallel else 1,
         dp_shard_size=2,
         model_parallel_enabled=True,
         device_mesh=mesh,
@@ -146,7 +148,7 @@ def test_expert_partition_localizes_replicated_routes():
 
 
 def _run_qwen_folded_parallel_parity(
-    rank, world_size, rendezvous_file, model_path, checkpoint_path
+    rank, world_size, rendezvous_file, model_path, checkpoint_path, sequence_parallel
 ):
     os.environ["LOCAL_RANK"] = str(rank)
     dist.init_process_group(
@@ -161,7 +163,9 @@ def _run_qwen_folded_parallel_parity(
             (1, world_size, 1),
             mesh_dim_names=("dp_replicate", "tp", "dp_shard"),
         )
-        pconfig = _pconfig(mesh, world_size)
+        pconfig = _pconfig(
+            mesh, world_size, sequence_parallel=sequence_parallel
+        )
         config = Qwen3MoeConfig.from_pretrained(model_path)
 
         reference = Qwen3MoeForCausalLM.from_pretrained(model_path)
@@ -216,6 +220,23 @@ def _run_qwen_folded_parallel_parity(
                 atol=1e-4,
                 msg=lambda message, parameter_name=name: f"{parameter_name}: {message}",
             )
+
+            if name.endswith(".mlp.gate.weight"):
+                gathered_router_gradients = [
+                    torch.empty_like(parameter.grad) for _ in range(world_size)
+                ]
+                dist.all_gather(
+                    gathered_router_gradients,
+                    parameter.grad,
+                    group=mesh.get_group("tp"),
+                )
+                for gathered_gradient in gathered_router_gradients[1:]:
+                    torch.testing.assert_close(
+                        gathered_gradient,
+                        gathered_router_gradients[0],
+                        rtol=0,
+                        atol=0,
+                    )
 
         reference_norm = torch.sqrt(
             sum(
@@ -293,13 +314,34 @@ def test_qwen_folded_tensor_and_expert_parallel_matches_reference(tmp_path):
     rendezvous_file = tmp_path / "rendezvous"
     mp.spawn(
         _run_qwen_folded_parallel_parity,
-        args=(2, rendezvous_file, model_path, tmp_path / "checkpoint"),
+        args=(2, rendezvous_file, model_path, tmp_path / "checkpoint", False),
         nprocs=2,
         join=True,
     )
 
 
-def _run_dense_qwen_parallel_parity(rank, world_size, rendezvous_file, model_path):
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_qwen_sequence_and_expert_parallel_matches_reference(tmp_path):
+    torch.manual_seed(1234)
+    model_path = tmp_path / "tiny-qwen-sp"
+    Qwen3MoeForCausalLM(_tiny_qwen_config()).save_pretrained(model_path)
+    mp.spawn(
+        _run_qwen_folded_parallel_parity,
+        args=(
+            2,
+            tmp_path / "sp-rendezvous",
+            model_path,
+            tmp_path / "sp-checkpoint",
+            True,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _run_dense_qwen_parallel_parity(
+    rank, world_size, rendezvous_file, model_path, sequence_parallel
+):
     os.environ["LOCAL_RANK"] = str(rank)
     dist.init_process_group(
         backend="gloo",
@@ -313,7 +355,9 @@ def _run_dense_qwen_parallel_parity(rank, world_size, rendezvous_file, model_pat
             (1, world_size, 1),
             mesh_dim_names=("dp_replicate", "tp", "dp_shard"),
         )
-        pconfig = _dense_pconfig(mesh, world_size)
+        pconfig = _dense_pconfig(
+            mesh, world_size, sequence_parallel=sequence_parallel
+        )
         config = Qwen3Config.from_pretrained(model_path)
         reference = Qwen3ForCausalLM.from_pretrained(model_path).train()
         model, plan = load_causal_lm(
@@ -353,14 +397,32 @@ def test_dense_qwen_tensor_parallel_matches_reference(tmp_path):
     Qwen3ForCausalLM(_tiny_dense_qwen_config()).save_pretrained(model_path)
     mp.spawn(
         _run_dense_qwen_parallel_parity,
-        args=(2, tmp_path / "dense-rendezvous", model_path),
+        args=(2, tmp_path / "dense-rendezvous", model_path, False),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_dense_qwen_sequence_parallel_matches_reference(tmp_path):
+    torch.manual_seed(4321)
+    model_path = tmp_path / "tiny-dense-qwen-sp"
+    Qwen3ForCausalLM(_tiny_dense_qwen_config()).save_pretrained(model_path)
+    mp.spawn(
+        _run_dense_qwen_parallel_parity,
+        args=(2, tmp_path / "dense-sp-rendezvous", model_path, True),
         nprocs=2,
         join=True,
     )
 
 
 def _run_composed_parallel_parity(
-    rank, world_size, rendezvous_file, model_path, checkpoint_path
+    rank,
+    world_size,
+    rendezvous_file,
+    model_path,
+    checkpoint_path,
+    sequence_parallel,
 ):
     os.environ["LOCAL_RANK"] = str(rank)
     dist.init_process_group(
@@ -375,7 +437,9 @@ def _run_composed_parallel_parity(
             (1, 2, 2),
             mesh_dim_names=("dp_replicate", "tp", "dp_shard"),
         )
-        pconfig = _composed_pconfig(mesh)
+        pconfig = _composed_pconfig(
+            mesh, sequence_parallel=sequence_parallel
+        )
         tp_rank = mesh.get_local_rank("tp")
         dp_shard_rank = mesh.get_local_rank("dp_shard")
         config = Qwen3MoeConfig.from_pretrained(model_path)
@@ -535,6 +599,26 @@ def test_folded_tp_ep_composes_with_fsdp(tmp_path):
             tmp_path / "composed-rendezvous",
             model_path,
             tmp_path / "composed-checkpoint",
+            False,
+        ),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_sequence_tp_ep_composes_with_fsdp(tmp_path):
+    torch.manual_seed(9876)
+    model_path = tmp_path / "tiny-composed-sp-qwen"
+    Qwen3MoeForCausalLM(_tiny_qwen_config()).save_pretrained(model_path)
+    mp.spawn(
+        _run_composed_parallel_parity,
+        args=(
+            4,
+            tmp_path / "composed-sp-rendezvous",
+            model_path,
+            tmp_path / "composed-sp-checkpoint",
+            True,
         ),
         nprocs=4,
         join=True,

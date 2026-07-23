@@ -52,6 +52,11 @@ class CheckpointManager:
 
     def __init__(self, engine):
         self.engine = engine
+        self.control_group = (
+            dist.new_group(backend="gloo")
+            if dist.is_initialized() and dist.is_gloo_available()
+            else None
+        )
 
     @property
     def wrapper(self):
@@ -95,15 +100,31 @@ class CheckpointManager:
         if not dist.is_initialized():
             return value
         payload = [value if self.rank == 0 else None]
-        dist.broadcast_object_list(payload, src=0)
+        dist.broadcast_object_list(payload, src=0, group=self.control_group)
         return payload[0]
 
     def _collect_errors(self, local_error: Optional[str]) -> list[str]:
         if not dist.is_initialized():
             return [local_error] if local_error is not None else []
         errors: list[Optional[str]] = [None] * self.world_size
-        dist.all_gather_object(errors, local_error)
+        dist.all_gather_object(errors, local_error, group=self.control_group)
         return [error for error in errors if error is not None]
+
+    def _synchronize_collective_phase(self) -> None:
+        """Finish subgroup CUDA work before launching a world collective.
+
+        Model-parallel checkpoints use several disjoint TP and DP-shard NCCL
+        communicators. Without a device synchronization, a faster subgroup can
+        enqueue the next default-group collective while another subgroup is
+        still completing the previous phase, making communicator launch order
+        timing-dependent.
+        """
+        if not dist.is_initialized():
+            return
+        device = torch.device(self.engine.device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dist.barrier(group=self.control_group)
 
     def _topology(self) -> dict[str, int]:
         pconfig = self.engine.pconfig
@@ -112,6 +133,7 @@ class CheckpointManager:
             "dp_replicate_size": getattr(pconfig, "dp_replicate_size", 1),
             "dp_shard_size": getattr(pconfig, "dp_shard_size", 1),
             "tp_size": getattr(pconfig, "tp_size", 1),
+            "sp_size": getattr(pconfig, "sp_size", 1),
             "ep_size": getattr(pconfig, "ep_size", 1),
             "expert_tp_size": getattr(pconfig, "expert_tp_size", 1),
         }
@@ -144,10 +166,14 @@ class CheckpointManager:
             torch.cuda.set_rng_state(state["cuda"], self.engine.device)
 
     def full_state_dict(self):
-        return self.wrapper.full_state_dict()
+        state = self.wrapper.full_state_dict()
+        self._synchronize_collective_phase()
+        return state
 
     def load_full_state_dict(self, state_dict, strict: bool = True):
-        return self.wrapper.load_full_state_dict(state_dict, strict=strict)
+        result = self.wrapper.load_full_state_dict(state_dict, strict=strict)
+        self._synchronize_collective_phase()
+        return result
 
     def sharded_state_dict(self) -> dict[str, Any]:
         return self.wrapper.sharded_state_dict()
@@ -244,6 +270,7 @@ class CheckpointManager:
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Atomically save an exact-resume, same-topology sharded checkpoint."""
+        self._synchronize_collective_phase()
         path = Path(path)
         temporary = self._prepare_checkpoint_directory(path)
         local_error = None

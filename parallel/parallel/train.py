@@ -8,7 +8,7 @@ from .dataloader import dist_data_loader
 from .engine.engine import ParallelEngine
 from .engine.model_loading import load_causal_lm
 from .eval import eval_bpb, get_token_bytes
-from .logging import get_logger
+from .logging import configure_logging, get_logger
 from .state import ParallelConfig, RuntimeState, init_dist
 from .tracking import WandBTracker
 from .utils import dist_cleanup, load_cfg
@@ -19,6 +19,7 @@ def main():
     cfg = load_cfg()
     RuntimeState(backend=cfg.config.backend) # init singleton once
     init_dist(cfg)
+    configure_logging()
     pconfig = ParallelConfig(cfg)
     pconfig.set_device_mesh(cfg.config.device_type)
     device = pconfig.device
@@ -95,6 +96,7 @@ def main():
     eval_dataloader_state = (resume or {}).get("eval_dataloader_state")
     for step in range(start_step, cfg.config.max_steps + 1):
         step_start = time.time()
+        pengine.reset_step_memory_stats()
         total_loss = torch.tensor(0.0, device=device)
         dataloader_state = None
         for _ in range(grad_accum_steps):
@@ -105,6 +107,14 @@ def main():
         
         pengine.step()
         loss_log = pengine.reduce_loss(total_loss)
+        memory_stats = pengine.step_memory_stats()
+        gib = 1024 ** 3
+        forward_peak_gib = (
+            memory_stats["forward_peak_allocated_bytes"] / gib
+        )
+        backward_peak_gib = (
+            memory_stats["backward_peak_allocated_bytes"] / gib
+        )
 
         now = time.time()
         dt = now - step_start
@@ -113,13 +123,17 @@ def main():
             logger.info(
                 f"step {step:6d} | loss {loss_log.item():.4f} "
                 f"| lr {pengine.lr:.2e} "
-                f"| tok/s {toks_per_sec:,.0f}"
+                f"| tok/s {toks_per_sec:,.0f} "
+                f"| fwd peak {forward_peak_gib:.2f} GiB "
+                f"| bwd peak {backward_peak_gib:.2f} GiB"
             )
 
         wandb.log({
             "train/loss": loss_log.item(),
             "opt/lr": pengine.lr,
             "speed/eff_tokens_per_sec": toks_per_sec,
+            "memory/forward_peak_allocated_gib": forward_peak_gib,
+            "memory/backward_peak_allocated_gib": backward_peak_gib,
             "step": step,
         }, step=step)
 

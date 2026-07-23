@@ -137,11 +137,15 @@ class ParallelConfig:
             raise ValueError(
                 f"Parallel mesh size {self.total_size} does not match distributed world size {self.world_size}"
             )
+        if self.sp_size not in (1, self.tp_size):
+            raise ValueError(
+                "Sequence parallelism reuses the TP ranks and requires sp == 1 or sp == tp"
+            )
         unsupported = {
             name: size
             for name, size in sizes.items()
             if name not in _SUPPORTED_MESH_DIM_NAMES
-            and name not in {"ep", "expert_tp"}
+            and name not in {"ep", "expert_tp", "sp"}
             and size > 1
         }
         if unsupported:
@@ -210,7 +214,7 @@ class ParallelConfig:
     def total_size(self):
         return (
             self.dp_replicate_size * self.dp_shard_size
-            * self.model_parallel_size * self.cp_size * self.sp_size
+            * self.model_parallel_size * self.cp_size
             * self.pp_size
         )
     

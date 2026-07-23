@@ -14,6 +14,28 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from ..profiling import profile
 
 
+def _all_gather_contiguous(output, input, *, group):
+    """Use the contiguous all-gather name available in this PyTorch release."""
+    collective = getattr(dist, "all_gather_single", None)
+    if collective is None:
+        collective = dist.all_gather_into_tensor
+    return collective(output, input, group=group)
+
+
+def _reduce_scatter_contiguous(output, input, *, op, group, async_op=False):
+    """Use the contiguous reduce-scatter name available in this release."""
+    collective = getattr(dist, "reduce_scatter_single", None)
+    if collective is None:
+        collective = dist.reduce_scatter_tensor
+    return collective(
+        output,
+        input,
+        op=op,
+        group=group,
+        async_op=async_op,
+    )
+
+
 @dataclass
 class ParamMeta:
     """FSDP state for one logical model parameter."""
@@ -246,14 +268,14 @@ class DPParamUnit:
             raise RuntimeError("Cannot all-gather before sharding")
 
         full_buffers: list[torch.Tensor] = []
-        with profile("all-gather"):
+        with profile("all-gather", enabled=False):
             for meta in self.param_metas:
                 local = self._padded_local_shard(meta)
                 gathered_shape = (meta.padded_rows * self.world_size, *meta.shape[1:])
                 gathered = torch.empty(
                     gathered_shape, dtype=local.dtype, device=self.device
                 )
-                dist.all_gather_single(gathered, local, group=self.group)
+                _all_gather_contiguous(gathered, local, group=self.group)
                 full = gathered.narrow(0, 0, meta.shape[0])
                 meta.parameter.data = full
                 self._set_registered_parameter(meta, meta.parameter)
@@ -309,7 +331,7 @@ class DPParamUnit:
                 dtype=grad_buf.dtype,
                 device=self.device,
             )
-            work = dist.reduce_scatter_single(
+            work = _reduce_scatter_contiguous(
                 shard_grad,
                 grad_buf,
                 op=dist.ReduceOp.SUM,

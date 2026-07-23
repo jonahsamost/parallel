@@ -2,10 +2,40 @@ from __future__ import annotations
 
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM
-from transformers.integrations.tensor_parallel import ALL_PARALLEL_STYLES
+from transformers.integrations.tensor_parallel import (
+    ALL_PARALLEL_STYLES,
+    ColwiseParallel,
+    RowwiseParallel,
+)
 
 from ...state import Strategies
 from .plan import GradientReduction, ModelParallelPlan
+from .sequence_parallel import reduce_scatter_sequence
+
+
+class ColwiseSequenceParallel(ColwiseParallel):
+    """Column parallel after an explicit sequence all-gather.
+
+    The gather's backward performs the necessary reduce-scatter, so the usual
+    column-parallel input-gradient all-reduce must be omitted.
+    """
+
+    def _prepare_input_fn(self, mod, inputs, device_mesh):
+        return inputs[0] if inputs else inputs
+
+
+class RowwiseSequenceParallel(RowwiseParallel):
+    """Row parallel whose partial output is reduce-scattered over sequence."""
+
+    def _prepare_output_fn(self, mod, outputs, device_mesh):
+        outputs = reduce_scatter_sequence(outputs, device_mesh.get_group(), dim=1)
+        if hasattr(mod, "_bias") and mod._bias is not None:
+            outputs = outputs + mod._bias
+        return outputs
+
+
+ALL_PARALLEL_STYLES.register("colwise_sequence", ColwiseSequenceParallel())
+ALL_PARALLEL_STYLES.register("rowwise_sequence", RowwiseSequenceParallel())
 
 
 def tensor_parallel_mesh(pconfig):
