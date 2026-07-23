@@ -6,6 +6,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from parallel.parallel.engine.model_parallel import ExpertPartition, TokenDispatcher
+from parallel.parallel.profiling import (
+    collective_phase,
+    configure_collective_profiling,
+    finish_collective_profile_step,
+    start_collective_profile_step,
+)
 
 
 def _run_zero_receive_dispatch(rank, world_size, rendezvous_file):
@@ -17,6 +23,8 @@ def _run_zero_receive_dispatch(rank, world_size, rendezvous_file):
         world_size=world_size,
     )
     try:
+        configure_collective_profiling(enabled=True, device="cpu")
+        start_collective_profile_step()
         partition = ExpertPartition(num_experts=4, ep_size=2, ep_rank=rank)
         dispatcher = TokenDispatcher(partition, dist.group.WORLD)
         hidden = (
@@ -29,22 +37,29 @@ def _run_zero_receive_dispatch(rank, world_size, rendezvous_file):
         # expert work while still sending routes and receiving combined output.
         indices = torch.tensor([[0, 1], [1, 0]])
 
-        received, local_indices, received_scores, state = dispatcher.dispatch(
-            hidden, indices, scores
-        )
-        assert local_indices.shape == (8 if rank == 0 else 0, 1)
-        expert_output = received * received_scores
-        combined = dispatcher.combine(expert_output, state)
-        torch.testing.assert_close(combined, hidden)
+        with collective_phase("forward"):
+            received, local_indices, received_scores, state = dispatcher.dispatch(
+                hidden, indices, scores
+            )
+            assert local_indices.shape == (8 if rank == 0 else 0, 1)
+            expert_output = received * received_scores
+            combined = dispatcher.combine(expert_output, state)
+            torch.testing.assert_close(combined, hidden)
 
-        combined.square().sum().backward()
+        with collective_phase("backward"):
+            combined.square().sum().backward()
         torch.testing.assert_close(hidden.grad, 2 * hidden)
         torch.testing.assert_close(
             scores.grad,
             2
             * hidden.detach().square().sum(dim=-1, keepdim=True).expand_as(scores),
         )
+        profile_lines = finish_collective_profile_step()
+        assert any("op=ep_all_to_all" in line for line in profile_lines)
+        assert any("phase=forward" in line for line in profile_lines)
+        assert any("phase=backward" in line for line in profile_lines)
     finally:
+        configure_collective_profiling(enabled=False)
         dist.destroy_process_group()
 
 

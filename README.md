@@ -113,7 +113,37 @@ with profile("training_step", device=device, use_torch_profiler=True):
 ```
 
 Timings are logged in milliseconds through the rank-aware project logger. Use
-`synchronize=True` for accurate CUDA timings; it deliberately prevents CUDA
+`engine.collective_profiling=true` to record deferred CUDA events around FSDP,
+TP, SP, and EP collectives and emit one cross-rank aggregate per operation and
+phase after each training step:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train \
+  parallel.tp=2 parallel.sp=2 parallel.ep=2 parallel.dp_shard=2 \
+  engine.collective_profiling=true
+```
+
+The summary includes calls and payload per rank, CUDA p50/p95/max timing, and
+the rank/unit/parameter responsible for the slowest event. CUDA events are
+resolved once at step end so per-collective synchronization does not destroy
+communication overlap.
+
+For a timeline trace, the scheduled PyTorch profiler can warm up on the first
+step and capture only the second:
+
+```bash
+torchrun --nproc-per-node=4 -m parallel.parallel.train \
+  parallel.tp=2 parallel.sp=2 parallel.ep=2 parallel.dp_shard=2 \
+  config.max_steps=2 engine.collective_profiling=true \
+  engine.torch_profiler=true \
+  engine.torch_profiler_trace_dir=/tmp/qwen3-profile
+```
+
+This writes one compressed trace per rank. The default schedule uses one warmup
+step and one active step; adjust `engine.torch_profiler_warmup_steps` and
+`engine.torch_profiler_active_steps` for longer investigations.
+
+Use `synchronize=True` for accurate CUDA timings; it deliberately prevents CUDA
 work from overlapping across the measured boundary. CUDA events measure work
 on the current CUDA stream and wait for the end event when the block exits. The
 PyTorch profiler logs its ten most expensive operators and is best enabled only

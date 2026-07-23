@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 
 from ...state import Strategies
+from ...profiling import collective_profile
 from .plan import ModelParallelPlan
 
 
@@ -30,15 +31,29 @@ def global_grad_norm(
             continue
         gradient = _local_tensor(parameter.grad)
         local_sq_norm += gradient.detach().float().pow(2).sum().to(device)
-    dist.all_reduce(local_sq_norm, op=dist.ReduceOp.SUM, group=tp_mesh.get_group())
+    with collective_profile(
+        "tp_all_reduce",
+        value=local_sq_norm,
+        mode="grad_norm",
+        detail="global_norm",
+    ):
+        dist.all_reduce(
+            local_sq_norm, op=dist.ReduceOp.SUM, group=tp_mesh.get_group()
+        )
     mesh = pconfig.device_mesh
     if pconfig.dp_shard_size > 1:
         dp_shard_group = mesh.get_group(Strategies.DP_SHARD)
-        dist.all_reduce(
-            local_sq_norm,
-            op=dist.ReduceOp.SUM,
-            group=dp_shard_group,
-        )
+        with collective_profile(
+            "fsdp_all_reduce",
+            value=local_sq_norm,
+            mode="grad_norm",
+            detail="global_norm",
+        ):
+            dist.all_reduce(
+                local_sq_norm,
+                op=dist.ReduceOp.SUM,
+                group=dp_shard_group,
+            )
     return local_sq_norm.sqrt()
 
 

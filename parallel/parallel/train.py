@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from omegaconf import OmegaConf
 from pathlib import Path
 import time
@@ -9,6 +13,7 @@ from .engine.engine import ParallelEngine
 from .engine.model_loading import load_causal_lm
 from .eval import eval_bpb, get_token_bytes
 from .logging import configure_logging, get_logger
+from .profiling import scheduled_torch_profiler
 from .state import ParallelConfig, RuntimeState, init_dist
 from .tracking import WandBTracker
 from .utils import dist_cleanup, load_cfg
@@ -94,6 +99,25 @@ def main():
 
     start_step = (resume or {}).get("step", 0) + 1
     eval_dataloader_state = (resume or {}).get("eval_dataloader_state")
+    torch_profiler = scheduled_torch_profiler(
+        enabled=getattr(cfg.engine, "torch_profiler", False),
+        trace_dir=getattr(
+            cfg.engine, "torch_profiler_trace_dir", "/tmp/parallel-traces"
+        ),
+        rank=pconfig.rank,
+        warmup_steps=getattr(cfg.engine, "torch_profiler_warmup_steps", 1),
+        active_steps=getattr(cfg.engine, "torch_profiler_active_steps", 1),
+    )
+    if torch_profiler is not None:
+        torch_profiler.__enter__()
+        if pconfig.is_main_process:
+            logger.info(
+                "PyTorch profiler enabled: warming up for %d step(s), "
+                "capturing %d step(s), traces=%s",
+                cfg.engine.torch_profiler_warmup_steps,
+                cfg.engine.torch_profiler_active_steps,
+                cfg.engine.torch_profiler_trace_dir,
+            )
     for step in range(start_step, cfg.config.max_steps + 1):
         step_start = time.time()
         pengine.reset_step_memory_stats()
@@ -106,8 +130,13 @@ def main():
             total_loss += loss.detach() 
         
         pengine.step()
+        if torch_profiler is not None:
+            # Advance before reporting/evaluation so only the training step is
+            # part of the scheduled active trace.
+            torch_profiler.step()
         loss_log = pengine.reduce_loss(total_loss)
         memory_stats = pengine.step_memory_stats()
+        collective_profile_lines = pengine.finish_step_collective_profile()
         gib = 1024 ** 3
         forward_peak_gib = (
             memory_stats["forward_peak_allocated_bytes"] / gib
@@ -127,6 +156,8 @@ def main():
                 f"| fwd peak {forward_peak_gib:.2f} GiB "
                 f"| bwd peak {backward_peak_gib:.2f} GiB"
             )
+            for profile_line in collective_profile_lines:
+                logger.info(profile_line)
 
         wandb.log({
             "train/loss": loss_log.item(),
@@ -159,7 +190,9 @@ def main():
                 dataloader_state=dataloader_state,
                 eval_dataloader_state=eval_dataloader_state,
             )
-    
+
+    if torch_profiler is not None:
+        torch_profiler.__exit__(None, None, None)
     wandb.finish()
     dist_cleanup()
 

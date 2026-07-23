@@ -30,6 +30,11 @@ engine:
   checkpoint_every_n: 1
   find_unused_parameters: false  # mainly for dense vs moe
   overlap_backward_reductions: true 
+  collective_profiling: false
+  torch_profiler: false
+  torch_profiler_trace_dir: "/tmp/parallel-traces"
+  torch_profiler_warmup_steps: 1
+  torch_profiler_active_steps: 1
   compile: false
 
 

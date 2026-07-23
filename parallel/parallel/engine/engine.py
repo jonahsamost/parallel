@@ -4,6 +4,12 @@ from torch.distributed.tensor import DTensor
 
 from ..state import Strategies
 from ..utils import DTYPE_DICT
+from ..profiling import (
+    collective_phase,
+    configure_collective_profiling,
+    finish_collective_profile_step,
+    start_collective_profile_step,
+)
 from .checkpoint import CheckpointManager
 from .dp_sharded import FSDPWrapper
 from ._dp_sharded_utils import local_tensor
@@ -60,6 +66,10 @@ class ParallelEngine:
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.checkpoint = CheckpointManager(self)
+        configure_collective_profiling(
+            enabled=getattr(cfg.engine, "collective_profiling", False),
+            device=device,
+        )
         self.reset_step_memory_stats()
 
     def _sync_initial_state(self):
@@ -93,6 +103,10 @@ class ParallelEngine:
         """Reset the forward/backward peaks accumulated across microbatches."""
         self._forward_peak_memory_allocated = 0
         self._backward_peak_memory_allocated = 0
+        start_collective_profile_step()
+
+    def finish_step_collective_profile(self) -> list[str]:
+        return finish_collective_profile_step()
 
     def _reset_cuda_peak_memory(self):
         if self.device.type == "cuda":
@@ -122,13 +136,14 @@ class ParallelEngine:
     
     def forward(self, x, y):
         self._reset_cuda_peak_memory()
-        self.sync_buffers()
-        with torch.autocast(device_type=self.pconfig.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
-            if self.mp_wrapper.is_active:
-                outputs = self.model(input_ids=x)
-                outputs.loss = self.mp_wrapper.training_loss(outputs, y)
-            else:
-                outputs = self.model(input_ids=x, labels=y)
+        with collective_phase("forward"):
+            self.sync_buffers()
+            with torch.autocast(device_type=self.pconfig.device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+                if self.mp_wrapper.is_active:
+                    outputs = self.model(input_ids=x)
+                    outputs.loss = self.mp_wrapper.training_loss(outputs, y)
+                else:
+                    outputs = self.model(input_ids=x, labels=y)
         self._forward_peak_memory_allocated = max(
             self._forward_peak_memory_allocated,
             self._cuda_peak_memory_allocated(),
@@ -149,13 +164,14 @@ class ParallelEngine:
     
     def backward(self, loss):
         self._reset_cuda_peak_memory()
-        self.fsdp_wrapper.prepare_backward(loss)
-        with self.mp_wrapper.backward_context():
-            if self.grad_scaler.is_enabled():
-                self.grad_scaler.scale(loss).backward()
-            else:
-                loss.backward()
-        self.fsdp_wrapper.finalize_backward()
+        with collective_phase("backward"):
+            self.fsdp_wrapper.prepare_backward(loss)
+            with self.mp_wrapper.backward_context():
+                if self.grad_scaler.is_enabled():
+                    self.grad_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            self.fsdp_wrapper.finalize_backward()
         self._backward_peak_memory_allocated = max(
             self._backward_peak_memory_allocated,
             self._cuda_peak_memory_allocated(),
@@ -173,6 +189,10 @@ class ParallelEngine:
         #   - Adjust the scale.
         # Synchronize scaled gradients so every replica observes the same
         # overflow before GradScaler decides whether to step.
+        with collective_phase("optimizer"):
+            self._step_impl()
+
+    def _step_impl(self):
         self._average_gradients()
 
         if self.grad_scaler.is_enabled():

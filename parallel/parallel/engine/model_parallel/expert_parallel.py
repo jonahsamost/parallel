@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from ...profiling import collective_profile
 from .token_dispatch import TokenDispatcher
 
 
@@ -92,7 +93,13 @@ class _AllReduceBackward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gradient):
         gradient = gradient.contiguous().clone()
-        dist.all_reduce(gradient, op=dist.ReduceOp.SUM, group=ctx.group)
+        with collective_profile(
+            "ep_all_reduce",
+            value=gradient,
+            mode="replicated_token_grad",
+            detail="expert_boundary",
+        ):
+            dist.all_reduce(gradient, op=dist.ReduceOp.SUM, group=ctx.group)
         return gradient, None
 
 
@@ -100,7 +107,13 @@ class _AllReduceForward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, group):
         result = value.contiguous().clone()
-        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+        with collective_profile(
+            "ep_all_reduce",
+            value=result,
+            mode="replicated_token_output",
+            detail="expert_boundary",
+        ):
+            dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
         return result
 
     @staticmethod

@@ -3,19 +3,33 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from ...profiling import collective_profile
+
 
 def _all_gather_contiguous(output, value, group) -> None:
     operation = getattr(dist, "all_gather_single", None)
     if operation is None:
         operation = dist.all_gather_into_tensor
-    operation(output, value, group=group)
+    with collective_profile(
+        "sp_all_gather",
+        value=value,
+        mode="sequence",
+        detail=f"shape={tuple(value.shape)}",
+    ):
+        operation(output, value, group=group)
 
 
 def _reduce_scatter_contiguous(output, value, group) -> None:
     operation = getattr(dist, "reduce_scatter_single", None)
     if operation is None:
         operation = dist.reduce_scatter_tensor
-    operation(output, value, group=group)
+    with collective_profile(
+        "sp_reduce_scatter",
+        value=value,
+        mode="sequence",
+        detail=f"shape={tuple(value.shape)}",
+    ):
+        operation(output, value, group=group)
 
 
 def _canonical_dim(tensor: torch.Tensor, dim: int) -> int:
@@ -208,7 +222,13 @@ class _AllReduceForwardIdentityBackward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, group):
         result = value.contiguous().clone()
-        dist.all_reduce(result, group=group)
+        with collective_profile(
+            "sp_all_reduce",
+            value=result,
+            mode="router_probability",
+            detail="load_balancing_loss",
+        ):
+            dist.all_reduce(result, group=group)
         return result
 
     @staticmethod
@@ -236,8 +256,20 @@ def sequence_parallel_load_balancing_loss(
     token_count = torch.tensor(
         logits.shape[0], dtype=torch.float32, device=logits.device
     )
-    dist.all_reduce(counts, group=group)
-    dist.all_reduce(token_count, group=group)
+    with collective_profile(
+        "sp_all_reduce",
+        value=counts,
+        mode="router_counts",
+        detail="load_balancing_loss",
+    ):
+        dist.all_reduce(counts, group=group)
+    with collective_profile(
+        "sp_all_reduce",
+        value=token_count,
+        mode="token_count",
+        detail="load_balancing_loss",
+    ):
+        dist.all_reduce(token_count, group=group)
     probability_sum = _AllReduceForwardIdentityBackward.apply(
         probability_sum, group
     )

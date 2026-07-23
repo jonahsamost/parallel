@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
+import parallel.parallel.engine._dp_param_unit as dp_param_unit_module
 from parallel.parallel.engine.dp_sharded import FSDPWrapper
 from parallel.parallel.engine.engine import ParallelEngine
 from parallel.parallel.engine._dp_param_unit import (
@@ -566,6 +567,87 @@ def test_partially_used_unit_reduces_after_expected_subset_accumulates(tmp_path)
             torch.testing.assert_close(actual_state[name], expected)
 
 
+def test_multi_parameter_unit_uses_one_packed_collective_each_way(
+    tmp_path, monkeypatch
+):
+    with _single_rank_mesh(tmp_path / "bucket-rendezvous") as mesh:
+        model = SparseUnitModel()
+        wrapper = FSDPWrapper(
+            model,
+            SimpleNamespace(dp_shard_size=2, device_mesh=mesh),
+            device=torch.device("cpu"),
+        )
+        wrapper.shard_model()
+        unit = wrapper.units[0]
+        assert len(unit.param_metas) > 1
+        assert unit._local_param_bucket is not None
+        bucket_storage = unit._local_param_bucket.untyped_storage().data_ptr()
+        assert all(
+            meta.padded_shard is not None
+            and meta.padded_shard.untyped_storage().data_ptr() == bucket_storage
+            for meta in unit.param_metas
+        )
+
+        original_all_gather = dp_param_unit_module._all_gather_contiguous
+        original_reduce_scatter = dp_param_unit_module._reduce_scatter_contiguous
+        all_gather_calls = []
+        reduce_scatter_calls = []
+
+        def tracked_all_gather(output, input, *, group):
+            all_gather_calls.append((output.shape, input.shape))
+            return original_all_gather(output, input, group=group)
+
+        def tracked_reduce_scatter(output, input, *, op, group, async_op=False):
+            reduce_scatter_calls.append((output.shape, input.shape))
+            return original_reduce_scatter(
+                output,
+                input,
+                op=op,
+                group=group,
+                async_op=async_op,
+            )
+
+        monkeypatch.setattr(
+            dp_param_unit_module, "_all_gather_contiguous", tracked_all_gather
+        )
+        monkeypatch.setattr(
+            dp_param_unit_module, "_reduce_scatter_contiguous", tracked_reduce_scatter
+        )
+
+        unit.all_gather()
+        for meta in unit.param_metas:
+            meta.parameter.grad = torch.ones_like(meta.parameter)
+        unit.start_gradient_reduction()
+        unit.finish_gradient_reduction()
+        unit.accumulate_reduced_gradients([True] * len(unit.param_metas))
+        first_grad_bucket = unit._accumulated_shard_grad_bucket_ref()
+        assert first_grad_bucket is not None
+
+        unit.reset_backward_state()
+        unit.all_gather()
+        for meta in unit.param_metas:
+            meta.parameter.grad = torch.full_like(meta.parameter, 2)
+        unit.start_gradient_reduction()
+        assert unit._pending_shard_grad_bucket is first_grad_bucket
+        unit.finish_gradient_reduction()
+        unit.accumulate_reduced_gradients([True] * len(unit.param_metas))
+
+        expected_shape = torch.Size([unit._bucket_numel])
+        assert all_gather_calls == [
+            (expected_shape, expected_shape),
+            (expected_shape, expected_shape),
+        ]
+        assert reduce_scatter_calls == [
+            (expected_shape, expected_shape),
+            (expected_shape, expected_shape),
+        ]
+        for meta in unit.param_metas:
+            torch.testing.assert_close(
+                meta.sharded_param.grad._local_tensor,
+                torch.full_like(meta.sharded_param.grad._local_tensor, 3),
+            )
+
+
 def test_prefetch_stream_waits_for_current_stream(monkeypatch):
     unit = DPParamUnit.__new__(DPParamUnit)
     unit._full_params_buf = None
@@ -577,7 +659,7 @@ def test_prefetch_stream_waits_for_current_stream(monkeypatch):
     unit._prefetch_stream.wait_stream.side_effect = (
         lambda stream: call_order.append("wait")
     )
-    unit.all_gather.side_effect = lambda: call_order.append("gather")
+    unit.all_gather.side_effect = lambda **kwargs: call_order.append("gather")
 
     current_stream = Mock()
     prefetch_event = Mock()
@@ -588,6 +670,6 @@ def test_prefetch_stream_waits_for_current_stream(monkeypatch):
     unit.prefetch()
 
     unit._prefetch_stream.wait_stream.assert_called_once_with(current_stream)
-    unit.all_gather.assert_called_once_with()
+    unit.all_gather.assert_called_once_with(mode="prefetch")
     prefetch_event.record.assert_called_once_with(unit._prefetch_stream)
     assert call_order == ["wait", "gather"]

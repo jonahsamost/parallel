@@ -140,3 +140,117 @@ def test_profile_uses_torch_profiler(monkeypatch):
         "model",
         "operator table",
     )
+
+
+def test_collective_profiler_aggregates_without_per_call_logging():
+    profiling.configure_collective_profiling(enabled=True, device="cpu")
+    profiling.start_collective_profile_step()
+    try:
+        with profiling.collective_phase("forward"):
+            with profiling.collective_profile(
+                "fsdp_all_gather",
+                payload_bytes=4 * 1024 ** 2,
+                mode="prefetch",
+                detail="unit3:model.layers.1.self_attn.q_proj.weight",
+                device="cpu",
+            ):
+                pass
+            with profiling.collective_profile(
+                "fsdp_all_gather",
+                payload_bytes=8 * 1024 ** 2,
+                mode="prefetch",
+                detail="unit4:model.layers.1.self_attn.k_proj.weight",
+                device="cpu",
+            ):
+                pass
+
+        lines = profiling.finish_collective_profile_step()
+    finally:
+        profiling.configure_collective_profiling(enabled=False)
+
+    assert len(lines) == 1
+    assert "phase=forward" in lines[0]
+    assert "op=fsdp_all_gather" in lines[0]
+    assert "mode=prefetch" in lines[0]
+    assert "calls/rank=2" in lines[0]
+    assert "payload/max-rank=12.0MiB" in lines[0]
+
+
+def test_collective_profiler_defers_async_record_until_complete():
+    profiling.configure_collective_profiling(enabled=True, device="cpu")
+    profiling.start_collective_profile_step()
+    try:
+        with profiling.collective_phase("backward"):
+            measurement = profiling.collective_profile(
+                "fsdp_reduce_scatter",
+                payload_bytes=16 * 1024 ** 2,
+                mode="overlapped",
+                detail="unit1:model.layers.0.weight",
+                device="cpu",
+                defer_cuda_end=True,
+            )
+            with measurement:
+                pass
+            assert profiling._COLLECTIVE_PROFILER.records == []
+            measurement.complete()
+
+        lines = profiling.finish_collective_profile_step()
+    finally:
+        profiling.configure_collective_profiling(enabled=False)
+
+    assert len(lines) == 1
+    assert "phase=backward" in lines[0]
+    assert "op=fsdp_reduce_scatter" in lines[0]
+
+
+def test_scheduled_torch_profiler_warms_up_then_captures(monkeypatch, tmp_path):
+    schedule = Mock()
+    handler = Mock()
+    profiler_instance = Mock()
+    schedule_factory = Mock(return_value=schedule)
+    handler_factory = Mock(return_value=handler)
+    profiler_factory = Mock(return_value=profiler_instance)
+    monkeypatch.setattr(torch.cuda, "is_available", Mock(return_value=False))
+    monkeypatch.setattr(torch.profiler, "schedule", schedule_factory)
+    monkeypatch.setattr(
+        torch.profiler, "tensorboard_trace_handler", handler_factory
+    )
+    monkeypatch.setattr(torch.profiler, "profile", profiler_factory)
+
+    result = profiling.scheduled_torch_profiler(
+        enabled=True,
+        trace_dir=tmp_path / "traces",
+        rank=3,
+        warmup_steps=1,
+        active_steps=1,
+    )
+
+    assert result is profiler_instance
+    schedule_factory.assert_called_once_with(
+        wait=0, warmup=1, active=1, repeat=1
+    )
+    handler_factory.assert_called_once_with(
+        str(tmp_path / "traces"),
+        worker_name="rank3",
+        use_gzip=True,
+    )
+    profiler_factory.assert_called_once_with(
+        activities=[torch.profiler.ProfilerActivity.CPU],
+        schedule=schedule,
+        on_trace_ready=handler,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+    )
+
+
+def test_scheduled_torch_profiler_can_be_disabled(tmp_path):
+    result = profiling.scheduled_torch_profiler(
+        enabled=False,
+        trace_dir=tmp_path / "traces",
+        rank=0,
+    )
+    assert result is None
+    assert not (tmp_path / "traces").exists()

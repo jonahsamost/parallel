@@ -5,25 +5,35 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from ...profiling import collective_profile
+
 
 class _VariableAllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, value, send_splits, receive_splits, group):
+    def forward(ctx, value, send_splits, receive_splits, group, mode, detail):
         ctx.send_splits = tuple(send_splits)
         ctx.receive_splits = tuple(receive_splits)
         ctx.group = group
+        ctx.mode = mode
+        ctx.detail = detail
         output = torch.empty(
             (sum(ctx.receive_splits), *value.shape[1:]),
             dtype=value.dtype,
             device=value.device,
         )
-        dist.all_to_all_single(
-            output,
-            value.contiguous(),
-            output_split_sizes=list(ctx.receive_splits),
-            input_split_sizes=list(ctx.send_splits),
-            group=group,
-        )
+        with collective_profile(
+            "ep_all_to_all",
+            value=value,
+            mode=mode,
+            detail=detail,
+        ):
+            dist.all_to_all_single(
+                output,
+                value.contiguous(),
+                output_split_sizes=list(ctx.receive_splits),
+                input_split_sizes=list(ctx.send_splits),
+                group=group,
+            )
         return output
 
     @staticmethod
@@ -33,18 +43,28 @@ class _VariableAllToAll(torch.autograd.Function):
             dtype=gradient.dtype,
             device=gradient.device,
         )
-        dist.all_to_all_single(
-            output,
-            gradient.contiguous(),
-            output_split_sizes=list(ctx.send_splits),
-            input_split_sizes=list(ctx.receive_splits),
-            group=ctx.group,
-        )
-        return output, None, None, None
+        with collective_profile(
+            "ep_all_to_all",
+            value=gradient,
+            mode=f"{ctx.mode}_grad",
+            detail=ctx.detail,
+        ):
+            dist.all_to_all_single(
+                output,
+                gradient.contiguous(),
+                output_split_sizes=list(ctx.send_splits),
+                input_split_sizes=list(ctx.receive_splits),
+                group=ctx.group,
+            )
+        return output, None, None, None, None, None
 
 
-def variable_all_to_all(value, send_splits, receive_splits, group):
-    return _VariableAllToAll.apply(value, send_splits, receive_splits, group)
+def variable_all_to_all(
+    value, send_splits, receive_splits, group, *, mode="", detail=""
+):
+    return _VariableAllToAll.apply(
+        value, send_splits, receive_splits, group, mode, detail
+    )
 
 
 @dataclass
@@ -69,7 +89,13 @@ class TokenDispatcher:
             destinations, minlength=self.world_size
         ).to(dtype=torch.int64)
         receive_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(receive_counts, send_counts, group=self.group)
+        with collective_profile(
+            "ep_all_to_all",
+            value=send_counts,
+            mode="split_counts",
+            detail="route_counts",
+        ):
+            dist.all_to_all_single(receive_counts, send_counts, group=self.group)
         return tuple(send_counts.tolist()), tuple(receive_counts.tolist())
 
     def dispatch(self, hidden_states, global_indices, scores):
@@ -98,13 +124,28 @@ class TokenDispatcher:
         send_experts = (flat_experts[order] - destinations * self.partition.local_count)
         send_scores = flat_scores[order]
         received_hidden = variable_all_to_all(
-            send_hidden, send_splits, receive_splits, self.group
+            send_hidden,
+            send_splits,
+            receive_splits,
+            self.group,
+            mode="dispatch_hidden",
+            detail="routes",
         )
         received_experts = variable_all_to_all(
-            send_experts, send_splits, receive_splits, self.group
+            send_experts,
+            send_splits,
+            receive_splits,
+            self.group,
+            mode="dispatch_experts",
+            detail="routes",
         )
         received_scores = variable_all_to_all(
-            send_scores, send_splits, receive_splits, self.group
+            send_scores,
+            send_splits,
+            receive_splits,
+            self.group,
+            mode="dispatch_scores",
+            detail="routes",
         )
         state = DispatchState(
             send_splits, receive_splits, source_tokens, tokens
@@ -122,6 +163,8 @@ class TokenDispatcher:
             state.receive_splits,
             state.send_splits,
             self.group,
+            mode="combine_hidden",
+            detail="routes",
         )
         result = torch.zeros(
             (state.num_source_tokens, *returned.shape[1:]),

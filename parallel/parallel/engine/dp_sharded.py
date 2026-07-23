@@ -181,6 +181,7 @@ class FSDPWrapper:
                 device=self.device,
                 named_parameters=named_params,
                 reshard_after_forward=reshard_after_forward,
+                overlap_backward_reductions=self.overlap_backward_reductions,
             )
             unit.shard()
             self.units.append(unit)

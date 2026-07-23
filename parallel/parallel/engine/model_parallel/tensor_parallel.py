@@ -9,6 +9,7 @@ from transformers.integrations.tensor_parallel import (
 )
 
 from ...state import Strategies
+from ...profiling import collective_profile
 from .plan import GradientReduction, ModelParallelPlan
 from .sequence_parallel import reduce_scatter_sequence
 
@@ -124,7 +125,13 @@ def install_tensor_parallel_gradient_hooks(model, plan: ModelParallelPlan, tp_me
 
     def sum_tp_gradient(gradient):
         reduced = gradient.contiguous().clone()
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
+        with collective_profile(
+            "tp_all_reduce",
+            value=reduced,
+            mode="replicated_param_grad",
+            detail="parameter_hook",
+        ):
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
         return reduced
 
     for name, parameter in model.named_parameters():
